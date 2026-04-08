@@ -3,9 +3,10 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.9}"
+APP_VERSION="${APP_VERSION:-v1.3.0}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
+
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
 RULES_DB="${FB_RULES_DB:-$CONF_DIR/rules.db}"
 BACKUP_DIR="${FB_BACKUP_DIR:-$CONF_DIR/backups}"
@@ -15,6 +16,7 @@ TMP_DIR="${FB_TMP_DIR:-/tmp/fb}"
 SELF_TARGET="${FB_SELF_TARGET:-/usr/local/bin/fb}"
 SYSTEMD_DIR="${FB_SYSTEMD_DIR:-/etc/systemd/system}"
 SYSCTL_FILE="${FB_SYSCTL_FILE:-/etc/sysctl.d/99-fb.conf}"
+
 DEFAULT_LISTEN_ADDR="${FB_DEFAULT_LISTEN_ADDR:-0.0.0.0}"
 GOST_TARGET_BIN="${FB_GOST_TARGET_BIN:-/usr/local/bin/fb-gost}"
 REALM_TARGET_BIN="${FB_REALM_TARGET_BIN:-/usr/local/bin/fb-realm}"
@@ -29,10 +31,39 @@ C6='\033[1;34m'
 CW='\033[1;37m'
 DIM='\033[2m'
 
-log() { echo -e "${C1}[INFO]${C0} $*"; }
-warn() { echo -e "${C2}[WARN]${C0} $*"; }
-err() { echo -e "${C3}[ERR ]${C0} $*" >&2; }
-die() { err "$*"; exit 1; }
+FB_LOG_FILE="${LOG_DIR}/fb.log"
+
+trap 'on_error $LINENO "$BASH_COMMAND"' ERR
+
+on_error() {
+  local line="${1:-?}" cmd="${2:-?}"
+  err "脚本执行失败: line=${line} cmd=${cmd}"
+}
+
+write_log_file() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$FB_LOG_FILE" 2>/dev/null || true
+}
+
+log() {
+  write_log_file "[INFO] $*"
+  echo -e "${C1}[INFO]${C0} $*"
+}
+
+warn() {
+  write_log_file "[WARN] $*"
+  echo -e "${C2}[WARN]${C0} $*" >&2
+}
+
+err() {
+  write_log_file "[ERR ] $*"
+  echo -e "${C3}[ERR ]${C0} $*" >&2
+}
+
+die() {
+  err "$*"
+  exit 1
+}
 
 trim() {
   local s="$*"
@@ -63,7 +94,6 @@ read_prompt() {
   printf -v "$__result_var" '%s' "$input"
 }
 
-
 need_root() {
   is_test_mode && return 0
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行。"
@@ -77,6 +107,7 @@ need_systemd() {
 init_dirs() {
   mkdir -p "$CONF_DIR" "$BACKUP_DIR" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR"
   touch "$RULES_DB"
+  touch "$FB_LOG_FILE"
 }
 
 ensure_base_layout() {
@@ -93,6 +124,7 @@ get_os() {
   source /etc/os-release
   os_id="${ID:-}"
   os_like="${ID_LIKE:-}"
+
   if command -v apt-get >/dev/null 2>&1; then
     pkg_mgr="apt"
   elif command -v dnf >/dev/null 2>&1; then
@@ -207,10 +239,14 @@ apply_sysctl_setting() {
 optimize_network() {
   need_root
   is_test_mode && return 0
+
   local file="$SYSCTL_FILE" skipped=0 key value
+  mkdir -p "$(dirname "$file")"
   touch "$file"
   : > "$file"
+
   modprobe tcp_bbr 2>/dev/null || true
+
   while IFS='=' read -r key value; do
     [[ -n "${key:-}" ]] || continue
     if apply_sysctl_setting "$key" "$value"; then
@@ -235,6 +271,7 @@ net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_keepalive_time=600
 EOF
+
   if (( skipped > 0 )); then
     warn "网络优化中有 ${skipped} 项因当前内核/容器环境限制被跳过。"
   fi
@@ -245,6 +282,8 @@ install_self() {
   need_root
   local src
   src="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
+  mkdir -p "$(dirname "$SELF_TARGET")"
+
   if [[ -n "$src" && -f "$src" && "$src" != "/proc/"* && "$src" != "/dev/"* ]]; then
     install -m 0755 "$src" "$SELF_TARGET"
   else
@@ -264,6 +303,7 @@ install_self() {
 
 create_or_update_service() {
   local svc="$1" content="$2"
+  mkdir -p "$SYSTEMD_DIR"
   printf '%s\n' "$content" > "$SYSTEMD_DIR/$svc"
 }
 
@@ -271,6 +311,7 @@ install_rebuild_service() {
   need_root
   local exec_path="$SELF_TARGET"
   [[ -x "$exec_path" ]] || exec_path="$(readlink -f "$0")"
+
   create_or_update_service "fb-rebuild.service" "[Unit]
 Description=FB rebuild all forwarding rules on boot
 After=network-online.target
@@ -280,11 +321,104 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$exec_path rebuild-onboot
 RemainAfterExit=yes
+TimeoutStartSec=60
 
 [Install]
 WantedBy=multi-user.target"
-  systemctl daemon-reload
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable fb-rebuild.service >/dev/null 2>&1 || true
+}
+
+latest_asset_url() {
+  local repo="$1" pattern="$2"
+  local urls=""
+  urls="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | jq -r '.assets[].browser_download_url' 2>/dev/null || true)"
+  [[ -n "$urls" ]] || return 0
+  printf '%s\n' "$urls" | grep -m1 -E "$pattern" || true
+}
+
+is_realm_relay_binary() {
+  local bin="${1:-}"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  "$bin" --help 2>&1 | grep -qiE 'relay tool|static tcp relay|high efficiency relay'
+}
+
+find_gost_binary() {
+  if [[ -x "$GOST_TARGET_BIN" ]]; then
+    printf '%s\n' "$GOST_TARGET_BIN"
+    return 0
+  fi
+  command -v gost 2>/dev/null || true
+}
+
+find_realm_binary() {
+  if is_realm_relay_binary "$REALM_TARGET_BIN"; then
+    printf '%s\n' "$REALM_TARGET_BIN"
+    return 0
+  fi
+  local existing
+  existing="$(command -v realm 2>/dev/null || true)"
+  if is_realm_relay_binary "$existing"; then
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  return 1
+}
+
+install_gost_binary() {
+  local url tmpd bin arch_pat existing
+  existing="$(find_gost_binary)"
+  if [[ -n "$existing" ]]; then
+    log "gost 已存在：$existing"
+    return 0
+  fi
+
+  tmpd="$(mktemp -d)"
+  arch_pat="$(release_arch_pattern)"
+  url="$(latest_asset_url 'go-gost/gost' "(linux|Linux).*${arch_pat}.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || die "无法自动获取 gost 最新版本下载地址，请手动安装。"
+
+  curl -fL "$url" -o "$tmpd/gost.pkg"
+  case "$url" in
+    *.zip) unzip -qo "$tmpd/gost.pkg" -d "$tmpd/unpack" ;;
+    *) tar -xf "$tmpd/gost.pkg" -C "$tmpd" ;;
+  esac
+
+  bin="$(find "$tmpd" -type f -name gost | head -n1)"
+  [[ -n "$bin" ]] || die "gost 安装失败：未找到二进制文件。"
+
+  install -m 0755 "$bin" "$GOST_TARGET_BIN"
+  rm -rf "$tmpd"
+}
+
+install_realm_binary() {
+  local url tmpd bin arch_pat existing
+  existing="$(find_realm_binary || true)"
+  if [[ -n "$existing" ]]; then
+    log "realm 已存在：$existing"
+    return 0
+  fi
+
+  tmpd="$(mktemp -d)"
+  arch_pat="$(release_arch_pattern)"
+  url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || die "无法自动获取 realm 最新版本下载地址，请手动安装。"
+
+  curl -fL "$url" -o "$tmpd/realm.pkg"
+  case "$url" in
+    *.zip) unzip -qo "$tmpd/realm.pkg" -d "$tmpd/unpack" ;;
+    *) tar -xf "$tmpd/realm.pkg" -C "$tmpd" ;;
+  esac
+
+  bin="$(find "$tmpd" -type f -name realm | head -n1)"
+  [[ -n "$bin" ]] || die "realm 安装失败：未找到二进制文件。"
+
+  install -m 0755 "$bin" "$REALM_TARGET_BIN"
+  rm -rf "$tmpd"
 }
 
 install_method_deps() {
@@ -323,93 +457,11 @@ install_method_deps() {
     realm)
       install_realm_binary
       ;;
-    *) die "未知方法：$1" ;;
+    *)
+      die "未知方法：$1"
+      ;;
   esac
   log "$1 依赖安装完成。"
-}
-
-latest_asset_url() {
-  local repo="$1" pattern="$2"
-  local urls=""
-  urls="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
-    | jq -r '.assets[].browser_download_url' 2>/dev/null || true)"
-  [[ -n "$urls" ]] || return 0
-  printf '%s\n' "$urls" | grep -m1 -E "$pattern" || true
-}
-
-is_realm_relay_binary() {
-  local bin="${1:-}"
-  [[ -n "$bin" && -x "$bin" ]] || return 1
-  "$bin" --help 2>&1 | grep -qiE 'relay tool|static tcp relay'
-}
-
-find_gost_binary() {
-  if [[ -x "$GOST_TARGET_BIN" ]]; then
-    printf '%s\n' "$GOST_TARGET_BIN"
-    return 0
-  fi
-  command -v gost 2>/dev/null || true
-}
-
-find_realm_binary() {
-  if is_realm_relay_binary "$REALM_TARGET_BIN"; then
-    printf '%s\n' "$REALM_TARGET_BIN"
-    return 0
-  fi
-  local existing
-  existing="$(command -v realm 2>/dev/null || true)"
-  if is_realm_relay_binary "$existing"; then
-    printf '%s\n' "$existing"
-    return 0
-  fi
-  return 1
-}
-
-install_gost_binary() {
-  local url tmpd bin arch_pat existing
-  existing="$(find_gost_binary)"
-  if [[ -n "$existing" ]]; then
-    log "gost 已存在：$existing"
-    return 0
-  fi
-  tmpd="$(mktemp -d)"
-  arch_pat="$(release_arch_pattern)"
-  url="$(latest_asset_url 'go-gost/gost' "(linux|Linux).*${arch_pat}.*(tar.gz|tgz|zip)$")"
-  [[ -n "$url" ]] || die "无法自动获取 gost 最新版本下载地址，请手动安装。"
-  curl -fL "$url" -o "$tmpd/gost.pkg"
-  case "$url" in
-    *.zip) unzip -qo "$tmpd/gost.pkg" -d "$tmpd/unpack" ;;
-    *) tar -xf "$tmpd/gost.pkg" -C "$tmpd" ;;
-  esac
-  bin="$(find "$tmpd" -type f -name gost | head -n1)"
-  [[ -n "$bin" ]] || die "gost 安装失败：未找到二进制文件。"
-  install -m 0755 "$bin" "$GOST_TARGET_BIN"
-  rm -rf "$tmpd"
-}
-
-install_realm_binary() {
-  local url tmpd bin arch_pat existing
-  existing="$(find_realm_binary || true)"
-  if [[ -n "$existing" ]]; then
-    log "realm 已存在：$existing"
-    return 0
-  fi
-  tmpd="$(mktemp -d)"
-  arch_pat="$(release_arch_pattern)"
-  url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
-  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
-  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
-  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
-  [[ -n "$url" ]] || die "无法自动获取 realm 最新版本下载地址，请手动安装。"
-  curl -fL "$url" -o "$tmpd/realm.pkg"
-  case "$url" in
-    *.zip) unzip -qo "$tmpd/realm.pkg" -d "$tmpd/unpack" ;;
-    *) tar -xf "$tmpd/realm.pkg" -C "$tmpd" ;;
-  esac
-  bin="$(find "$tmpd" -type f -name realm | head -n1)"
-  [[ -n "$bin" ]] || die "realm 安装失败：未找到二进制文件。"
-  install -m 0755 "$bin" "$REALM_TARGET_BIN"
-  rm -rf "$tmpd"
 }
 
 validate_port() {
@@ -425,8 +477,42 @@ validate_proto() {
 method_supports_proto() {
   local method="$1" proto="$2"
   case "$method:$proto" in
-    iptables:tcp|iptables:udp|socat:tcp|socat:udp|gost:tcp|realm:tcp|haproxy:tcp|rinetd:tcp|nginx:tcp) return 0 ;;
-    *) return 1 ;;
+    iptables:tcp|iptables:udp|socat:tcp|socat:udp|gost:tcp|realm:tcp|haproxy:tcp|rinetd:tcp|nginx:tcp)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+verify_method_ready() {
+  local method="$1"
+  case "$method" in
+    iptables)
+      cmd_exists iptables || die "未找到 iptables 可执行文件。"
+      ;;
+    haproxy)
+      cmd_exists haproxy || die "未找到 haproxy 可执行文件。"
+      ;;
+    socat)
+      cmd_exists socat || die "未找到 socat 可执行文件。"
+      ;;
+    gost)
+      [[ -n "$(find_gost_binary)" ]] || die "未找到 gost 可执行文件。"
+      ;;
+    realm)
+      [[ -n "$(find_realm_binary || true)" ]] || die "未找到 realm 可执行文件。"
+      ;;
+    rinetd)
+      cmd_exists rinetd || die "未找到 rinetd 可执行文件。"
+      ;;
+    nginx)
+      cmd_exists nginx || die "未找到 nginx 可执行文件。"
+      ;;
+    *)
+      die "未知方法：$method"
+      ;;
   esac
 }
 
@@ -452,7 +538,8 @@ remove_rule_line() {
 
 list_rules_raw() {
   local db_file="${1:-$RULES_DB}"
-  grep -vE '^\s*$' "$db_file" 2>/dev/null || true
+  grep -vE '^\s*
+``` "$db_file" 2>/dev/null || true
 }
 
 rule_count() {
@@ -476,13 +563,15 @@ resolve_host_status() {
 check_listen_conflict() {
   local method="$1" proto="$2" addr="$3" port="$4"
   [[ "$method" == "iptables" ]] && return 0
+
   local ss_filter
   if [[ "$proto" == "tcp" ]]; then
     ss_filter="-lnt"
   else
     ss_filter="-lnu"
   fi
-  if ss $ss_filter | awk '{print $4}' | grep -Eq "(^|[:\]])${port}$"; then
+
+  if ss $ss_filter 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:\]])${port}$"; then
     warn "端口 $port 似乎已被占用，若是本脚本已存在规则可忽略；否则建议更换端口。"
   fi
 }
@@ -544,8 +633,14 @@ flush_iptables_fb() {
   iptables -F FB_FORWARD || true
 }
 
+service_has_rules() {
+  local method="$1" db_file="${2:-$RULES_DB}"
+  grep -qE "^[^|]+\|${method}\|" "$db_file"
+}
+
 apply_iptables_rules_from_db() {
   local db_file="${1:-$RULES_DB}"
+
   if ! cmd_exists iptables; then
     if service_has_rules iptables "$db_file"; then
       err "未找到 iptables 可执行文件，无法重建 iptables 规则。"
@@ -553,19 +648,24 @@ apply_iptables_rules_from_db() {
     fi
     return 0
   fi
+
   ensure_iptables_base
   flush_iptables_fb
+
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
     [[ -n "${id:-}" ]] || continue
     [[ "$method" == "iptables" ]] || continue
+
     local dnat_target
     dnat_target="${target_host}:${target_port}"
+
     if [[ "$listen_addr" == "0.0.0.0" || -z "$listen_addr" ]]; then
       iptables -t nat -A FB_PREROUTING -p "$proto" --dport "$listen_port" -m comment --comment "fb:$id" -j DNAT --to-destination "$dnat_target"
     else
       iptables -t nat -A FB_PREROUTING -p "$proto" -d "$listen_addr" --dport "$listen_port" -m comment --comment "fb:$id" -j DNAT --to-destination "$dnat_target"
       iptables -t nat -A FB_OUTPUT -p "$proto" -d "$listen_addr" --dport "$listen_port" -m comment --comment "fb:$id" -j DNAT --to-destination "$dnat_target"
     fi
+
     iptables -A FB_FORWARD -p "$proto" -d "$target_host" --dport "$target_port" -m comment --comment "fb:$id" -j ACCEPT
     iptables -t nat -A FB_POSTROUTING -p "$proto" -d "$target_host" --dport "$target_port" -m comment --comment "fb:$id" -j MASQUERADE
   done < "$db_file"
@@ -574,6 +674,7 @@ apply_iptables_rules_from_db() {
 render_haproxy_config() {
   local db_file="${1:-$RULES_DB}"
   local cfg="$CONF_DIR/haproxy/haproxy.cfg"
+
   cat > "$cfg" <<'EOCFG'
 global
     maxconn 20000
@@ -592,13 +693,13 @@ EOCFG
     [[ -n "${id:-}" ]] || continue
     [[ "$method" == "haproxy" ]] || continue
     cat >> "$cfg" <<EOBLK
-
 frontend fe_${id//-/_}
     bind ${listen_addr}:${listen_port}
     default_backend be_${id//-/_}
 
 backend be_${id//-/_}
     server s_${id//-/_} ${target_host}:${target_port} check
+
 EOBLK
   done < "$db_file"
 }
@@ -607,6 +708,7 @@ ensure_haproxy_service() {
   local haproxy_bin
   haproxy_bin="$(bin_path haproxy)"
   [[ -n "$haproxy_bin" ]] || { err "未找到 haproxy 可执行文件。"; return 1; }
+
   create_or_update_service "fb-haproxy.service" "[Unit]
 Description=FB dedicated HAProxy
 After=network-online.target
@@ -617,6 +719,7 @@ Type=simple
 ExecStart=$haproxy_bin -W -db -f $CONF_DIR/haproxy/haproxy.cfg
 Restart=always
 RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
@@ -627,6 +730,7 @@ render_rinetd_config() {
   local cfg="$CONF_DIR/rinetd/rinetd.conf"
   mkdir -p "$CONF_DIR/rinetd"
   : > "$cfg"
+
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
     [[ -n "${id:-}" ]] || continue
     [[ "$method" == "rinetd" ]] || continue
@@ -638,6 +742,7 @@ ensure_rinetd_service() {
   local rinetd_bin
   rinetd_bin="$(bin_path rinetd)"
   [[ -n "$rinetd_bin" ]] || { err "未找到 rinetd 可执行文件。"; return 1; }
+
   create_or_update_service "fb-rinetd.service" "[Unit]
 Description=FB dedicated rinetd
 After=network-online.target
@@ -647,6 +752,8 @@ Wants=network-online.target
 Type=simple
 ExecStart=$rinetd_bin -f -c $CONF_DIR/rinetd/rinetd.conf
 Restart=always
+RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
@@ -656,6 +763,7 @@ render_nginx_config() {
   local db_file="${1:-$RULES_DB}"
   local cfg="$CONF_DIR/nginx/nginx.conf"
   local stream_dir="$CONF_DIR/nginx/streams"
+
   mkdir -p "$stream_dir"
   rm -f "$stream_dir"/*.conf
 
@@ -683,14 +791,14 @@ EORULE
 ${module_line}
 worker_processes auto;
 pid /run/fb-nginx.pid;
-error_log /var/log/fb/nginx-error.log warn;
+error_log ${LOG_DIR}/nginx-error.log warn;
 
 events {
     worker_connections 4096;
 }
 
 stream {
-    access_log /var/log/fb/nginx-stream-access.log;
+    access_log ${LOG_DIR}/nginx-stream-access.log;
     include ${stream_dir}/*.conf;
 }
 EOCFG
@@ -700,6 +808,7 @@ ensure_nginx_service() {
   local nginx_bin
   nginx_bin="$(bin_path nginx)"
   [[ -n "$nginx_bin" ]] || { err "未找到 nginx 可执行文件。"; return 1; }
+
   create_or_update_service "fb-nginx.service" "[Unit]
 Description=FB dedicated Nginx stream
 After=network-online.target
@@ -711,6 +820,7 @@ ExecStart=$nginx_bin -g 'daemon off;' -c $CONF_DIR/nginx/nginx.conf
 ExecStop=$nginx_bin -s quit -c $CONF_DIR/nginx/nginx.conf
 Restart=always
 RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
@@ -721,11 +831,13 @@ make_socat_service() {
   local socat_bin cmd
   socat_bin="$(bin_path socat)"
   [[ -n "$socat_bin" ]] || { err "未找到 socat 可执行文件。"; return 1; }
+
   if [[ "$proto" == "tcp" ]]; then
     cmd="$socat_bin TCP-LISTEN:${listen_port},bind=${listen_addr},fork,reuseaddr TCP:${target_host}:${target_port}"
   else
     cmd="$socat_bin UDP-LISTEN:${listen_port},bind=${listen_addr},fork,reuseaddr UDP:${target_host}:${target_port}"
   fi
+
   create_or_update_service "fb-socat-${id}.service" "[Unit]
 Description=FB socat ${id}
 After=network-online.target
@@ -736,6 +848,7 @@ Type=simple
 ExecStart=${cmd}
 Restart=always
 RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
@@ -746,6 +859,7 @@ make_gost_service() {
   local gost_bin
   gost_bin="$(find_gost_binary)"
   [[ -n "$gost_bin" ]] || { err "未找到 gost 可执行文件。"; return 1; }
+
   create_or_update_service "fb-gost-${id}.service" "[Unit]
 Description=FB gost ${id}
 After=network-online.target
@@ -756,6 +870,7 @@ Type=simple
 ExecStart=$gost_bin -L=tcp://${listen_addr}:${listen_port}/${target_host}:${target_port}
 Restart=always
 RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
@@ -766,7 +881,9 @@ make_realm_config_and_service() {
   local realm_bin
   realm_bin="$(find_realm_binary || true)"
   [[ -n "$realm_bin" ]] || { err "未找到 realm 可执行文件。"; return 1; }
+
   mkdir -p "$CONF_DIR/realm"
+
   cat > "$CONF_DIR/realm/${id}.toml" <<EOCFG
 [log]
 level = "info"
@@ -775,6 +892,7 @@ level = "info"
 listen = "${listen_addr}:${listen_port}"
 remote = "${target_host}:${target_port}"
 EOCFG
+
   create_or_update_service "fb-realm-${id}.service" "[Unit]
 Description=FB realm ${id}
 After=network-online.target
@@ -785,33 +903,33 @@ Type=simple
 ExecStart=$realm_bin -c $CONF_DIR/realm/${id}.toml
 Restart=always
 RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target"
-}
-
-service_has_rules() {
-  local method="$1" db_file="${2:-$RULES_DB}"
-  grep -qE "^[^|]+\|${method}\|" "$db_file"
 }
 
 stop_if_no_rules() {
   local method="$1" svc="$2" db_file="${3:-$RULES_DB}"
   if ! service_has_rules "$method" "$db_file"; then
     systemctl disable --now "$svc" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/$svc" 2>/dev/null || true
   fi
 }
 
 backup_configs() {
   need_root
   init_dirs
+
   local ts file tmp_file
   ts="$(date +%Y%m%d-%H%M%S)"
   file="$BACKUP_DIR/fb-backup-${ts}.tar.gz"
   tmp_file="$TMP_DIR/fb-backup-${ts}.tar.gz"
+
   rm -f "$tmp_file"
   tar --exclude="$BACKUP_DIR" --exclude="$BACKUP_DIR/*" -czf "$tmp_file" "$CONF_DIR" "$SYSTEMD_DIR"/fb-*.service 2>/dev/null \
     || tar --exclude="$BACKUP_DIR" --exclude="$BACKUP_DIR/*" -czf "$tmp_file" "$CONF_DIR"
+
   mv -f "$tmp_file" "$file"
   echo "$file"
 }
@@ -825,9 +943,19 @@ latest_backup() {
   list_backups | head -n1
 }
 
+is_port_listening() {
+  local port="$1" proto="${2:-tcp}"
+  if [[ "$proto" == "udp" ]]; then
+    ss -lnu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:\]])${port}$"
+  else
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:\]])${port}$"
+  fi
+}
+
 rebuild_services_from_db() {
   local db_file="${1:-$RULES_DB}"
   need_root
+
   systemctl daemon-reload >/dev/null 2>&1 || true
   apply_iptables_rules_from_db "$db_file" || return 1
 
@@ -835,10 +963,10 @@ rebuild_services_from_db() {
     local haproxy_bin
     render_haproxy_config "$db_file" || return 1
     ensure_haproxy_service || return 1
-    systemctl daemon-reload || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
     haproxy_bin="$(bin_path haproxy)"
     [[ -n "$haproxy_bin" ]] || return 1
-    "$haproxy_bin" -c -f "$CONF_DIR/haproxy/haproxy.cfg" >/dev/null || return 1
+    "$haproxy_bin" -c -f "$CONF_DIR/haproxy/haproxy.cfg" >/dev/null 2>&1 || return 1
     systemctl enable --now fb-haproxy.service >/dev/null 2>&1 || systemctl restart fb-haproxy.service || return 1
   else
     stop_if_no_rules haproxy fb-haproxy.service "$db_file"
@@ -847,7 +975,7 @@ rebuild_services_from_db() {
   if service_has_rules rinetd "$db_file"; then
     render_rinetd_config "$db_file" || return 1
     ensure_rinetd_service || return 1
-    systemctl daemon-reload || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now fb-rinetd.service >/dev/null 2>&1 || systemctl restart fb-rinetd.service || return 1
   else
     stop_if_no_rules rinetd fb-rinetd.service "$db_file"
@@ -857,17 +985,17 @@ rebuild_services_from_db() {
     local nginx_bin
     render_nginx_config "$db_file" || return 1
     ensure_nginx_service || return 1
-    systemctl daemon-reload || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
     nginx_bin="$(bin_path nginx)"
     [[ -n "$nginx_bin" ]] || return 1
-    "$nginx_bin" -t -c "$CONF_DIR/nginx/nginx.conf" >/dev/null || return 1
+    "$nginx_bin" -t -c "$CONF_DIR/nginx/nginx.conf" >/dev/null 2>&1 || return 1
     systemctl enable --now fb-nginx.service >/dev/null 2>&1 || systemctl restart fb-nginx.service || return 1
   else
     stop_if_no_rules nginx fb-nginx.service "$db_file"
   fi
 
   local current_units
-  current_units=$(find "$SYSTEMD_DIR" -maxdepth 1 -type f \( -name 'fb-socat-*.service' -o -name 'fb-gost-*.service' -o -name 'fb-realm-*.service' \) -printf '%f\n' 2>/dev/null || true)
+  current_units="$(find "$SYSTEMD_DIR" -maxdepth 1 -type f \( -name 'fb-socat-*.service' -o -name 'fb-gost-*.service' -o -name 'fb-realm-*.service' \) -printf '%f\n' 2>/dev/null || true)"
   if [[ -n "$current_units" ]]; then
     while IFS= read -r unit; do
       [[ -n "$unit" ]] || continue
@@ -891,13 +1019,20 @@ rebuild_services_from_db() {
     esac
   done < "$db_file"
 
-  systemctl daemon-reload || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
     [[ -n "${id:-}" ]] || continue
     case "$method" in
-      socat) systemctl enable --now "fb-socat-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-socat-${id}.service" || return 1 ;;
-      gost) systemctl enable --now "fb-gost-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-gost-${id}.service" || return 1 ;;
-      realm) systemctl enable --now "fb-realm-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-realm-${id}.service" || return 1 ;;
+      socat)
+        systemctl enable --now "fb-socat-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-socat-${id}.service" || return 1
+        ;;
+      gost)
+        systemctl enable --now "fb-gost-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-gost-${id}.service" || return 1
+        ;;
+      realm)
+        systemctl enable --now "fb-realm-${id}.service" >/dev/null 2>&1 || systemctl restart "fb-realm-${id}.service" || return 1
+        ;;
     esac
   done < "$db_file"
 
@@ -906,11 +1041,13 @@ rebuild_services_from_db() {
 
 ensure_rule_validity() {
   local method="$1" proto="$2" listen_addr="$3" listen_port="$4" target_host="$5" target_port="$6" db_file="${7:-$RULES_DB}"
+
   [[ -n "$method" && -n "$proto" && -n "$listen_addr" && -n "$listen_port" && -n "$target_host" && -n "$target_port" ]] || die "参数不足。"
   validate_proto "$proto" || die "协议只支持 tcp / udp"
   method_supports_proto "$method" "$proto" || die "方法 $method 不支持协议 $proto"
   validate_port "$listen_port" || die "监听端口无效：$listen_port"
   validate_port "$target_port" || die "目标端口无效：$target_port"
+
   grep -qE "^[^|]+\|${method}\|${proto}\|${listen_addr}\|${listen_port}\|${target_host}\|${target_port}(\||$)" "$db_file" 2>/dev/null && die "已存在相同规则。"
   return 0
 }
@@ -919,12 +1056,15 @@ prepare_method_runtime() {
   local method="$1"
   init_dirs
   ensure_base_layout
+
   if is_test_mode; then
     install_rebuild_service || true
     return 0
   fi
+
   install_base
   install_method_deps "$method"
+  verify_method_ready "$method"
   optimize_network
   install_rebuild_service
 }
@@ -948,10 +1088,13 @@ new_temp_rules_db() {
 commit_rules_db_transaction() {
   local staged_db="$1" action="${2:-规则变更}"
   local rollback_db backup_file
+
   rollback_db="$(mktemp "$TMP_DIR/rules.rollback.XXXXXX")"
   cp "$RULES_DB" "$rollback_db"
+
   backup_file="$(backup_configs | tail -n1)"
   cp "$staged_db" "$RULES_DB"
+
   if rebuild_services_from_db "$RULES_DB" >/dev/null; then
     rm -f "$staged_db" "$rollback_db"
     printf '%s' "$backup_file"
@@ -981,8 +1124,10 @@ add_rule() {
   staged_db="$(new_temp_rules_db)"
   ensure_rule_validity "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port" "$staged_db"
   check_listen_conflict "$method" "$proto" "$listen_addr" "$listen_port"
+
   id="$(persist_rule_only "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port" "$extra" "$staged_db")"
   backup_file="$(commit_rules_db_transaction "$staged_db" "添加规则")"
+
   log "规则已添加：[$id] $method $proto ${listen_addr}:${listen_port} -> ${target_host}:${target_port}"
   log "已自动备份到：$backup_file"
 }
@@ -990,6 +1135,7 @@ add_rule() {
 batch_add_rules() {
   need_root
   local method="$1" proto="$2" listen_addr="$3" start_listen_port="$4" default_target_port="$5" targets_csv="$6" extra="${7:-}"
+
   [[ -n "$targets_csv" ]] || die "请提供多个目标 IP/域名，使用逗号分隔。"
   validate_port "$start_listen_port" || die "起始监听端口无效：$start_listen_port"
   validate_port "$default_target_port" || die "默认目标端口无效：$default_target_port"
@@ -997,12 +1143,14 @@ batch_add_rules() {
   method_supports_proto "$method" "$proto" || die "方法 $method 不支持协议 $proto"
 
   prepare_method_runtime "$method"
+
   local staged_db
   staged_db="$(new_temp_rules_db)"
 
   local IFS=','
   local targets=()
   read -r -a targets <<< "$targets_csv"
+
   local idx=0 added=0 entry target_host target_port listen_port id backup_file
   local summaries=()
 
@@ -1012,6 +1160,7 @@ batch_add_rules() {
 
     target_host="$entry"
     target_port="$default_target_port"
+
     if [[ "$entry" =~ ^([^:]+):([0-9]+)$ ]]; then
       target_host="${BASH_REMATCH[1]}"
       target_port="${BASH_REMATCH[2]}"
@@ -1022,6 +1171,7 @@ batch_add_rules() {
 
     ensure_rule_validity "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port" "$staged_db"
     check_listen_conflict "$method" "$proto" "$listen_addr" "$listen_port"
+
     id="$(persist_rule_only "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port" "$extra" "$staged_db")"
     summaries+=("[$id] ${listen_addr}:${listen_port} -> ${target_host}:${target_port}")
     idx=$((idx + 1))
@@ -1029,7 +1179,9 @@ batch_add_rules() {
   done
 
   (( added > 0 )) || die "没有可添加的有效目标。"
+
   backup_file="$(commit_rules_db_transaction "$staged_db" "批量添加规则")"
+
   log "批量添加完成：共 ${added} 条，方案=${method}，协议=${proto}"
   local item
   for item in "${summaries[@]}"; do
@@ -1043,10 +1195,12 @@ delete_rule() {
   local id="$1" backup_file staged_db
   [[ -n "$id" ]] || die "请提供规则 ID。"
   get_rule_line "$id" | grep -q . || die "规则不存在：$id"
+
   staged_db="$(new_temp_rules_db)"
   remove_rule_line "$id" "$staged_db"
   backup_file="$(commit_rules_db_transaction "$staged_db" "删除规则")"
   cleanup_rule_artifacts "$id"
+
   log "规则已删除：$id"
   log "删除前备份：$backup_file"
 }
@@ -1054,15 +1208,18 @@ delete_rule() {
 stop_all_services() {
   need_root
   local units
-  units=$(find "$SYSTEMD_DIR" -maxdepth 1 -type f -name 'fb-*.service' -printf '%f\n' 2>/dev/null | sort || true)
+  units="$(find "$SYSTEMD_DIR" -maxdepth 1 -type f -name 'fb-*.service' -printf '%f\n' 2>/dev/null | sort || true)"
+
   if [[ -z "$units" ]]; then
     warn "未发现 fb 相关服务。"
     return 0
   fi
+
   while IFS= read -r unit; do
     [[ -n "$unit" ]] || continue
     systemctl stop "$unit" >/dev/null 2>&1 || true
   done <<< "$units"
+
   log "已停止所有 fb 相关服务。"
 }
 
@@ -1071,10 +1228,11 @@ uninstall_self() {
   local keep="${1:-yes}"
   local delete_source="${2:-no}"
   local units
+
   if [[ "$keep" == "yes" ]]; then
     systemctl disable --now fb-rebuild.service >/dev/null 2>&1 || true
     rm -f "$SYSTEMD_DIR/fb-rebuild.service"
-    systemctl daemon-reload || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     rm -f "$SELF_TARGET"
     if [[ "$delete_source" == "yes" ]]; then
       delete_invocation_source_if_needed
@@ -1085,7 +1243,7 @@ uninstall_self() {
   fi
 
   stop_all_services || true
-  units=$(find "$SYSTEMD_DIR" -maxdepth 1 -type f -name 'fb-*.service' -printf '%f\n' 2>/dev/null | sort || true)
+  units="$(find "$SYSTEMD_DIR" -maxdepth 1 -type f -name 'fb-*.service' -printf '%f\n' 2>/dev/null | sort || true)"
   if [[ -n "$units" ]]; then
     while IFS= read -r unit; do
       [[ -n "$unit" ]] || continue
@@ -1093,15 +1251,19 @@ uninstall_self() {
       rm -f "$SYSTEMD_DIR/$unit"
     done <<< "$units"
   fi
+
   cleanup_iptables_all || true
   cleanup_method_binaries || true
-  systemctl daemon-reload || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   rm -f "$SELF_TARGET"
   remove_network_optimization || true
   rm -rf "$CONF_DIR" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR"
+
   if [[ "$delete_source" == "yes" ]]; then
     delete_invocation_source_if_needed
   fi
+
   log "已彻底卸载：脚本 / 服务 / 规则 / 配置 / 备份 均已删除。"
 }
 
@@ -1110,6 +1272,7 @@ list_rules() {
     echo "当前没有规则。"
     return 0
   fi
+
   printf '%-22s %-9s %-5s %-22s %-8s %-24s %-8s\n' "RULE_ID" "METHOD" "PROTO" "LISTEN_ADDR" "LPORT" "TARGET_HOST" "TPORT"
   echo "---------------------------------------------------------------------------------------------------------------------"
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
@@ -1128,16 +1291,18 @@ rule_service_name() {
     rinetd) echo "fb-rinetd.service" ;;
     nginx) echo "fb-nginx.service" ;;
     iptables) echo "fb-rebuild.service" ;;
+    *) echo "-" ;;
   esac
 }
 
 probe_target_ms() {
   local host="$1" port="$2"
   local start end diff
+
   if [[ "$port" =~ ^[0-9]+$ ]]; then
-    start=$(date +%s%3N)
+    start=$(date +%s%3N 2>/dev/null || date +%s000)
     if timeout 3 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1; then
-      end=$(date +%s%3N)
+      end=$(date +%s%3N 2>/dev/null || date +%s000)
       diff=$((end - start))
       echo "${diff}ms"
     else
@@ -1156,6 +1321,9 @@ system_flag() {
       ;;
     bbr)
       [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "bbr" ]] && echo "已启用" || echo "未启用"
+      ;;
+    tfo)
+      [[ "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)" =~ ^[13]$ ]] && echo "已启用" || echo "未启用"
       ;;
     *)
       echo "-"
@@ -1178,19 +1346,28 @@ show_status_pretty() {
   echo -e "${CW}==============================================================${C0}"
   echo
   echo -e "${C4}=== 活跃转发规则 ===${C0}"
+
   if [[ "$count" == "0" ]]; then
     echo "暂无规则"
   else
     while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
       [[ -n "${id:-}" ]] || continue
-      local svc mark
+      local svc mark listen_mark
       svc="$(rule_service_name "$id" "$method")"
+
       if systemctl is-active --quiet "$svc" 2>/dev/null; then
         mark="✅"
       else
         mark="⚠️"
       fi
-      echo "$mark  ${method}  ${listen_addr}:${listen_port} -> ${target_host}:${target_port}  (${proto})"
+
+      if is_port_listening "$listen_port" "$proto"; then
+        listen_mark="监听中"
+      else
+        listen_mark="未监听"
+      fi
+
+      echo "$mark  ${method}  ${listen_addr}:${listen_port} -> ${target_host}:${target_port}  (${proto})  [${listen_mark}]"
     done < "$RULES_DB"
   fi
 
@@ -1209,6 +1386,7 @@ show_status_pretty() {
   echo -e "${C4}=== 系统配置 ===${C0}"
   echo "IP转发：$(system_flag ip_forward)"
   echo "BBR拥塞控制：$(system_flag bbr)"
+  echo "TCP Fast Open：$(system_flag tfo)"
   if [[ -n "${last_bak:-}" ]]; then
     echo "最近备份：$last_bak"
   else
@@ -1225,74 +1403,100 @@ status_rules() {
     echo "当前没有规则。"
     return 0
   fi
-  printf '%-22s %-9s %-24s %-24s %-12s %-10s\n' "RULE_ID" "METHOD" "LISTEN" "TARGET" "SERVICE" "TARGET_RTT"
-  echo "------------------------------------------------------------------------------------------------------------------"
+
+  printf '%-22s %-9s %-24s %-24s %-12s %-10s %-8s\n' "RULE_ID" "METHOD" "LISTEN" "TARGET" "SERVICE" "TARGET_RTT" "LISTEN"
+  echo "--------------------------------------------------------------------------------------------------------------------------------"
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
     [[ -n "${id:-}" ]] || continue
-    local svc status rtt
+    local svc status rtt listen_state
     svc="$(rule_service_name "$id" "$method")"
+
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
       status="active"
     else
       status="inactive"
     fi
+
     rtt="$(probe_target_ms "$target_host" "$target_port")"
-    printf '%-22s %-9s %-24s %-24s %-12s %-10s\n' "$id" "$method" "${listen_addr}:${listen_port}" "${target_host}:${target_port}" "$status" "$rtt"
+
+    if is_port_listening "$listen_port" "$proto"; then
+      listen_state="up"
+    else
+      listen_state="down"
+    fi
+
+    printf '%-22s %-9s %-24s %-24s %-12s %-10s %-8s\n' \
+      "$id" "$method" "${listen_addr}:${listen_port}" "${target_host}:${target_port}" "$status" "$rtt" "$listen_state"
   done < "$RULES_DB"
 }
 
 show_detail() {
   local id="$1"
   local line svc
+
   line="$(get_rule_line "$id")"
   [[ -n "$line" ]] || die "规则不存在：$id"
+
   IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra <<< "$line"
   svc="$(rule_service_name "$id" "$method")"
+
   echo "ID          : $id"
   echo "METHOD      : $method"
   echo "PROTO       : $proto"
   echo "LISTEN      : ${listen_addr}:${listen_port}"
   echo "TARGET      : ${target_host}:${target_port}"
   echo "SERVICE     : $svc"
+  echo "LISTENING   : $(is_port_listening "$listen_port" "$proto" && echo yes || echo no)"
   echo "TARGET RTT  : $(probe_target_ms "$target_host" "$target_port")"
   echo
-  systemctl status "$svc" --no-pager -l || true
+
+  systemctl status "$svc" --no-pager -l 2>/dev/null || true
 }
 
 restore_configs() {
   need_root
   local file="$1" current_backup
   [[ -f "$file" ]] || die "备份文件不存在：$file"
+
   current_backup="$(backup_configs | tail -n1)"
   tar -xzf "$file" -C /
-  systemctl daemon-reload
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   if ! rebuild_services_from_db >/dev/null; then
     err "备份恢复失败，正在尝试回滚到恢复前状态..."
     tar -xzf "$current_backup" -C /
-    systemctl daemon-reload || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     rebuild_services_from_db >/dev/null || true
     die "备份恢复失败，已尝试回滚。恢复前备份：$current_backup"
   fi
+
   log "备份已恢复：$file"
 }
 
 show_active_listeners() {
   echo "当前监听端口："
-  ss -lntup | sed -n '1,80p'
+  ss -lntup 2>/dev/null | sed -n '1,80p'
 }
 
 show_logs() {
   local lines="${1:-100}"
   local units=()
+
   while IFS= read -r u; do
     [[ -n "$u" ]] && units+=("-u" "$u")
   done < <(find "$SYSTEMD_DIR" -maxdepth 1 -type f -name 'fb-*.service' -printf '%f\n' 2>/dev/null | sort || true)
 
-  if [[ ${#units[@]} -eq 0 ]]; then
-    warn "未发现 fb 相关服务日志。"
-    return 0
+  if [[ ${#units[@]} -gt 0 ]] && command -v journalctl >/dev/null 2>&1; then
+    if journalctl --no-pager -n "$lines" "${units[@]}" 2>/dev/null; then
+      return 0
+    fi
   fi
-  journalctl --no-pager -n "$lines" "${units[@]}"
+
+  if [[ -f "$FB_LOG_FILE" ]]; then
+    tail -n "$lines" "$FB_LOG_FILE"
+  else
+    warn "未发现 fb 相关服务日志。"
+  fi
 }
 
 recommendation_table() {
@@ -1349,7 +1553,10 @@ help_msg() {
   fb add nginx tcp 0.0.0.0 2222 127.0.0.1 22
   fb batch-add realm tcp 0.0.0.0 33001 22 1.1.1.1,2.2.2.2,3.3.3.3:2222
 
-  说明：
+一键菜单：
+  bash <(curl -fsSL https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh)
+
+说明：
   1. 默认基于 systemd。
   2. iptables 使用独立 FB_* 链，不会直接清空你现有的其他规则。
   3. haproxy / rinetd / nginx 使用“专用实例”配置，不覆盖你已有主服务配置。
@@ -1380,6 +1587,7 @@ show_banner() {
 interactive_pick_method() {
   local __result_var="${1:-}"
   local picked=""
+
   echo -e "${C4}========== 转发方案对比 ==========${C0}"
   echo "1) iptables     - 延迟：低    | 适用：游戏 / RDP / VNC"
   echo "2) HAProxy      - 延迟：较低  | 适用：Web 服务 / 负载均衡"
@@ -1391,8 +1599,11 @@ interactive_pick_method() {
   echo
   echo "性能排序：iptables > realm > HAProxy/nginx > socat/rinetd > gost"
   echo "功能排序：gost > nginx/HAProxy > realm > socat/rinetd > iptables"
+
+  local n
   read_prompt n "请选择方案 [1]: "
   n="${n:-1}"
+
   case "$n" in
     1) picked="iptables" ;;
     2) picked="haproxy" ;;
@@ -1403,6 +1614,7 @@ interactive_pick_method() {
     7) picked="nginx" ;;
     *) die "无效选择。" ;;
   esac
+
   if [[ -n "$__result_var" ]]; then
     printf -v "$__result_var" '%s' "$picked"
   else
@@ -1438,6 +1650,7 @@ prompt_proto_for_method() {
     read_prompt proto_value "协议类型 [tcp]: "
     proto_value="${proto_value:-tcp}"
   fi
+
   if [[ -n "$__result_var" ]]; then
     printf -v "$__result_var" '%s' "$proto_value"
   else
@@ -1446,52 +1659,63 @@ prompt_proto_for_method() {
 }
 
 menu_add_rule() {
-  local method proto listen_addr listen_port target_host target_port status
+  local method proto listen_addr listen_port target_host target_port status yn
   show_banner
+
   echo -e "${C4}请输入转发配置信息：${C0}"
   read_prompt target_host "目标服务器 IP/域名: "
   [[ -n "$target_host" ]] || die "目标地址不能为空。"
+
   status="$(resolve_host_status "$target_host")"
   if [[ "$status" == "ok" ]]; then
     echo -e "解析检测：${C1}有效${C0}"
   else
     echo -e "解析检测：${C2}未解析成功${C0}（若是内网目标或稍后可达，可继续）"
   fi
+
   read_prompt target_port "目标端口: "
   read_prompt listen_addr "本地监听地址 [0.0.0.0]: "
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
   read_prompt listen_port "本地监听端口: "
+
   echo
   interactive_pick_method method
   prompt_proto_for_method "$method" proto
+
   echo
   echo -e "${C4}配置确认：${C0}"
   echo "目标服务器：${target_host}:${target_port}"
   echo "本地监听：${listen_addr}:${listen_port}"
   echo "协议类型：${proto}"
   echo "转发方式：${method}"
+
   read_prompt yn "确认添加？[Y/n]: "
   yn="${yn:-Y}"
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
+
   add_rule "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port"
 }
 
 menu_batch_add_rules() {
-  local method proto listen_addr start_port target_port targets_csv
+  local method proto listen_addr start_port target_port targets_csv yn
   show_banner
+
   echo -e "${C4}批量添加：同一方案同时转发多个 IP / 域名${C0}"
   echo "说明：会按起始监听端口自动递增，例如 33001,33002,33003 ..."
   echo "目标格式支持：1.1.1.1,2.2.2.2,example.com:2222"
   echo
+
   read_prompt targets_csv "多个目标 IP/域名（逗号分隔）: "
   [[ -n "$targets_csv" ]] || die "目标列表不能为空。"
   read_prompt target_port "默认目标端口: "
   read_prompt listen_addr "本地监听地址 [0.0.0.0]: "
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
   read_prompt start_port "起始本地监听端口: "
+
   echo
   interactive_pick_method method
   prompt_proto_for_method "$method" proto
+
   echo
   echo -e "${C4}配置确认：${C0}"
   echo "目标列表：$targets_csv"
@@ -1500,13 +1724,16 @@ menu_batch_add_rules() {
   echo "起始监听端口：$start_port"
   echo "协议类型：$proto"
   echo "转发方式：$method"
+
   read_prompt yn "确认批量添加？[Y/n]: "
   yn="${yn:-Y}"
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
+
   batch_add_rules "$method" "$proto" "$listen_addr" "$start_port" "$target_port" "$targets_csv"
 }
 
 menu_delete_rule() {
+  local id yn
   show_banner
   list_rules
   echo
@@ -1529,6 +1756,7 @@ menu_backups() {
 }
 
 menu_restore_backup() {
+  local f
   show_banner
   echo "可用备份："
   list_backups || true
@@ -1539,6 +1767,7 @@ menu_restore_backup() {
 }
 
 menu_stop_services() {
+  local yn
   show_banner
   read_prompt yn "确认停止所有 fb 相关服务？[y/N]: "
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
@@ -1546,12 +1775,14 @@ menu_stop_services() {
 }
 
 menu_uninstall() {
+  local n
   show_banner
   echo "1) 仅卸载 fb 命令，保留现有转发服务和配置"
   echo "2) 彻底卸载（删除脚本 / 服务 / 配置 / 备份 / 网络优化）"
   echo "3) 彻底卸载，并删除当前这个脚本文件"
   read_prompt n "请选择 [1]: "
   n="${n:-1}"
+
   case "$n" in
     1) uninstall_self yes ;;
     2) uninstall_self no ;;
@@ -1578,8 +1809,11 @@ menu_loop() {
     echo "13) 查看方案推荐"
     echo "0) 退出"
     echo
+
+    local choice
     read_prompt choice "请选择操作 [1]: "
     choice="${choice:-1}"
+
     case "$choice" in
       1) menu_add_rule; pause_enter ;;
       2) menu_batch_add_rules; pause_enter ;;
