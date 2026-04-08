@@ -244,6 +244,14 @@ main() {
   reset_env
   FB_REALM_TARGET_BIN="$STUB_DIR/fb-realm"
 
+  local realm_release_url="https://github.com/zhboner/realm/releases/download/v2.9.3/realm-x86_64-unknown-linux-gnu.tar.gz"
+  local realm_android_url="https://github.com/zhboner/realm/releases/download/v2.9.3/realm-x86_64-linux-android.tar.gz"
+  printf '%s\n' "$realm_release_url" | grep -qE '(amd64|x86_64).*unknown-linux-gnu.*(tar.gz|tgz|zip)$' || fail "realm release asset pattern should match x86_64 gnu asset naming"
+  if printf '%s\n' "$realm_android_url" | grep -qE '(amd64|x86_64).*unknown-linux-gnu.*(tar.gz|tgz|zip)$'; then
+    fail "realm release asset pattern should not match android asset naming"
+  fi
+  pass "realm release asset pattern matches current upstream naming"
+
   bash -n "$SCRIPT_PATH"
   pass "bash -n syntax check"
 

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.7}"
+APP_VERSION="${APP_VERSION:-v1.2.8}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -298,10 +298,11 @@ install_method_deps() {
 
 latest_asset_url() {
   local repo="$1" pattern="$2"
-  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
-    | jq -r '.assets[].browser_download_url' \
-    | grep -E "$pattern" \
-    | head -n1
+  local urls=""
+  urls="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+    | jq -r '.assets[].browser_download_url' 2>/dev/null || true)"
+  [[ -n "$urls" ]] || return 0
+  printf '%s\n' "$urls" | grep -m1 -E "$pattern" || true
 }
 
 is_realm_relay_binary() {
@@ -363,7 +364,10 @@ install_realm_binary() {
   fi
   tmpd="$(mktemp -d)"
   arch_pat="$(release_arch_pattern)"
-  url="$(latest_asset_url 'zhboner/realm' "(linux|unknown-linux-gnu).*${arch_pat}.*(tar.gz|tgz|zip)$")"
+  url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-gnu.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
+  [[ -n "$url" ]] || url="$(latest_asset_url 'zhboner/realm' "realm-slim-${arch_pat}.*unknown-linux-musl.*(tar.gz|tgz|zip)$")"
   [[ -n "$url" ]] || die "无法自动获取 realm 最新版本下载地址，请手动安装。"
   curl -fL "$url" -o "$tmpd/realm.pkg"
   case "$url" in
