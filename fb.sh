@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.1}"
+APP_VERSION="${APP_VERSION:-v1.2.2}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -1276,17 +1276,17 @@ show_banner() {
 }
 
 interactive_pick_method() {
-  echo -e "${C4}========== 转发方案对比 ==========${C0}"
-  echo "1) iptables     - 延迟：低    | 适用：游戏 / RDP / VNC"
-  echo "2) HAProxy      - 延迟：较低  | 适用：Web 服务 / 负载均衡"
-  echo "3) socat        - 延迟：较低  | 适用：通用 TCP / UDP 转发"
-  echo "4) gost         - 延迟：中等  | 适用：加密代理 / 多协议"
-  echo "5) realm        - 延迟：较低  | 适用：高并发 TCP 中转"
-  echo "6) rinetd       - 延迟：较低  | 适用：多端口 TCP 转发"
-  echo "7) nginx stream - 延迟：较低  | 适用：Web 场景 / SSL"
-  echo
-  echo "性能排序：iptables > realm > HAProxy/nginx > socat/rinetd > gost"
-  echo "功能排序：gost > nginx/HAProxy > realm > socat/rinetd > iptables"
+  echo -e "${C4}========== 转发方案对比 ==========${C0}" >&2
+  echo "1) iptables     - 延迟：低    | 适用：游戏 / RDP / VNC" >&2
+  echo "2) HAProxy      - 延迟：较低  | 适用：Web 服务 / 负载均衡" >&2
+  echo "3) socat        - 延迟：较低  | 适用：通用 TCP / UDP 转发" >&2
+  echo "4) gost         - 延迟：中等  | 适用：加密代理 / 多协议" >&2
+  echo "5) realm        - 延迟：较低  | 适用：高并发 TCP 中转" >&2
+  echo "6) rinetd       - 延迟：较低  | 适用：多端口 TCP 转发" >&2
+  echo "7) nginx stream - 延迟：较低  | 适用：Web 场景 / SSL" >&2
+  echo >&2
+  echo "性能排序：iptables > realm > HAProxy/nginx > socat/rinetd > gost" >&2
+  echo "功能排序：gost > nginx/HAProxy > realm > socat/rinetd > iptables" >&2
   read -rp "请选择方案 [1]: " n
   n="${n:-1}"
   case "$n" in
@@ -1299,6 +1299,13 @@ interactive_pick_method() {
     7) echo "nginx" ;;
     *) die "无效选择。" ;;
   esac
+}
+
+ensure_self_installed_for_menu() {
+  [[ -x "$SELF_TARGET" ]] && return 0
+  install_self
+  install_rebuild_service
+  log "首次运行已自动安装命令：fb"
 }
 
 prompt_proto_for_method() {
@@ -1565,6 +1572,7 @@ main() {
     menu)
       need_root
       need_systemd
+      ensure_self_installed_for_menu
       menu_loop
       ;;
     help|-h|--help)

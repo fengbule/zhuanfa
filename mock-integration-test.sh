@@ -157,6 +157,23 @@ run_fb() {
   bash "$SCRIPT_PATH" "$@"
 }
 
+run_fb_with_input() {
+  local input="$1"
+  shift
+  printf '%s' "$input" | \
+  FB_TEST_MODE=1 \
+  FB_CONF_DIR="$CONF_DIR" \
+  FB_BACKUP_DIR="$BACKUP_DIR" \
+  FB_LOG_DIR="$LOG_DIR" \
+  FB_STATE_DIR="$STATE_DIR" \
+  FB_TMP_DIR="$TMP_DIR" \
+  FB_SELF_TARGET="$SELF_TARGET" \
+  FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
+  FB_SYSCTL_FILE="$SYSCTL_FILE" \
+  PATH="$STUB_DIR:$PATH" \
+  bash "$SCRIPT_PATH" "$@"
+}
+
 run_fb_stdin() {
   FB_TEST_MODE=1 \
   FB_CONF_DIR="$CONF_DIR" \
@@ -178,6 +195,13 @@ main() {
 
   bash -n "$SCRIPT_PATH"
   pass "bash -n syntax check"
+
+  run_fb_with_input $'1\n9.9.9.9\n443\n\n32000\n1\n\nY\n\n0\n' menu >/dev/null
+  assert_file_exists "$SELF_TARGET" "menu mode auto-installed fb command"
+  assert_rule_count 1 "interactive menu added one rule"
+  assert_file_contains "$CONF_DIR/rules.db" "|iptables|tcp|0.0.0.0|32000|9.9.9.9|443|" "interactive menu captured method correctly"
+
+  reset_env
 
   run_fb add iptables tcp 0.0.0.0 30000 1.1.1.1 22 >/dev/null
   assert_rule_count 1 "iptables rule added without unrelated binaries"
