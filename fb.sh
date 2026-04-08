@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.6}"
+APP_VERSION="${APP_VERSION:-v1.2.7}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -47,10 +47,18 @@ is_test_mode() {
 
 read_prompt() {
   local __result_var="$1" prompt="$2" input=""
-  if [[ -t 0 && -r /dev/tty ]]; then
-    IFS= read -r -p "$prompt" input < /dev/tty || input=""
+  if is_test_mode; then
+    printf '%s' "$prompt"
+    IFS= read -r input || input=""
+  elif [[ -t 0 ]]; then
+    printf '%s' "$prompt"
+    IFS= read -r input || input=""
+  elif [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "$prompt" > /dev/tty
+    IFS= read -r input < /dev/tty || input=""
   else
-    IFS= read -r -p "$prompt" input || input=""
+    printf '%s' "$prompt" >&2
+    IFS= read -r input || input=""
   fi
   printf -v "$__result_var" '%s' "$input"
 }
