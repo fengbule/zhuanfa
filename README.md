@@ -25,6 +25,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh)
 ```
 
 首次通过上面的方式运行时，脚本会自动安装 `fb` 命令，之后可直接输入 `fb` 进入菜单。
+当仓库脚本有更新时，重新执行同一条一键命令也会自动刷新本机的 `fb` 到最新版本。
 
 一键安装到系统命令 `fb`：
 

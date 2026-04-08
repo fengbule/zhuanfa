@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.2}"
+APP_VERSION="${APP_VERSION:-v1.2.3}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -1276,6 +1276,8 @@ show_banner() {
 }
 
 interactive_pick_method() {
+  local __result_var="${1:-}"
+  local picked=""
   echo -e "${C4}========== 转发方案对比 ==========${C0}" >&2
   echo "1) iptables     - 延迟：低    | 适用：游戏 / RDP / VNC" >&2
   echo "2) HAProxy      - 延迟：较低  | 适用：Web 服务 / 负载均衡" >&2
@@ -1290,31 +1292,54 @@ interactive_pick_method() {
   read -rp "请选择方案 [1]: " n
   n="${n:-1}"
   case "$n" in
-    1) echo "iptables" ;;
-    2) echo "haproxy" ;;
-    3) echo "socat" ;;
-    4) echo "gost" ;;
-    5) echo "realm" ;;
-    6) echo "rinetd" ;;
-    7) echo "nginx" ;;
+    1) picked="iptables" ;;
+    2) picked="haproxy" ;;
+    3) picked="socat" ;;
+    4) picked="gost" ;;
+    5) picked="realm" ;;
+    6) picked="rinetd" ;;
+    7) picked="nginx" ;;
     *) die "无效选择。" ;;
   esac
+  if [[ -n "$__result_var" ]]; then
+    printf -v "$__result_var" '%s' "$picked"
+  else
+    printf '%s\n' "$picked"
+  fi
+}
+
+installed_self_version() {
+  [[ -f "$SELF_TARGET" ]] || return 1
+  sed -n 's/^APP_VERSION="${APP_VERSION:-\(v[^"]*\)}"/\1/p' "$SELF_TARGET" | head -n1
+}
+
+should_refresh_self_install() {
+  [[ ! -x "$SELF_TARGET" ]] && return 0
+  local installed_version
+  installed_version="$(installed_self_version || true)"
+  [[ -z "$installed_version" ]] && return 0
+  [[ "$installed_version" != "$APP_VERSION" ]]
 }
 
 ensure_self_installed_for_menu() {
-  [[ -x "$SELF_TARGET" ]] && return 0
+  should_refresh_self_install || return 0
   install_self
   install_rebuild_service
-  log "首次运行已自动安装命令：fb"
+  if [[ -x "$SELF_TARGET" ]]; then
+    log "已自动安装或更新命令：fb (${APP_VERSION})"
+  fi
 }
 
 prompt_proto_for_method() {
-  local method="$1"
+  local method="$1" __result_var="${2:-}" proto_value="tcp"
   if [[ "$method" == "iptables" || "$method" == "socat" ]]; then
-    read -rp "协议类型 [tcp]: " proto
-    echo "${proto:-tcp}"
+    read -rp "协议类型 [tcp]: " proto_value
+    proto_value="${proto_value:-tcp}"
+  fi
+  if [[ -n "$__result_var" ]]; then
+    printf -v "$__result_var" '%s' "$proto_value"
   else
-    echo "tcp"
+    printf '%s\n' "$proto_value"
   fi
 }
 
@@ -1335,8 +1360,8 @@ menu_add_rule() {
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
   read -rp "本地监听端口: " listen_port
   echo
-  method="$(interactive_pick_method)"
-  proto="$(prompt_proto_for_method "$method")"
+  interactive_pick_method method
+  prompt_proto_for_method "$method" proto
   echo
   echo -e "${C4}配置确认：${C0}"
   echo "目标服务器：${target_host}:${target_port}"
@@ -1363,8 +1388,8 @@ menu_batch_add_rules() {
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
   read -rp "起始本地监听端口: " start_port
   echo
-  method="$(interactive_pick_method)"
-  proto="$(prompt_proto_for_method "$method")"
+  interactive_pick_method method
+  prompt_proto_for_method "$method" proto
   echo
   echo -e "${C4}配置确认：${C0}"
   echo "目标列表：$targets_csv"
