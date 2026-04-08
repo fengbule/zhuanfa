@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fb.sh"
 TEST_ROOT="$(pwd)/.mock-fb"
 STUB_DIR="$TEST_ROOT/stubs"
+RUNTIME_SCRIPT="$TEST_ROOT/runtime/fb.sh"
 CONF_DIR="$TEST_ROOT/etc/fb"
 BACKUP_DIR="$CONF_DIR/backups"
 SYSTEMD_DIR="$TEST_ROOT/systemd"
@@ -69,7 +70,9 @@ EOF
 
 reset_env() {
   rm -rf "$TEST_ROOT"
-  mkdir -p "$STUB_DIR" "$BACKUP_DIR" "$SYSTEMD_DIR" "$(dirname "$SELF_TARGET")" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR" "$(dirname "$SYSCTL_FILE")"
+  mkdir -p "$STUB_DIR" "$BACKUP_DIR" "$SYSTEMD_DIR" "$(dirname "$SELF_TARGET")" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR" "$(dirname "$SYSCTL_FILE")" "$(dirname "$RUNTIME_SCRIPT")"
+  cp "$SCRIPT_PATH" "$RUNTIME_SCRIPT"
+  chmod +x "$RUNTIME_SCRIPT"
 
   cat > "$STUB_DIR/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -140,58 +143,106 @@ EOF
   make_stub sysctl
   make_stub socat
   make_stub gost
-  make_stub realm
+
+  cat > "$STUB_DIR/realm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--help" ]]; then
+  echo "realm discover join leave list"
+else
+  exit 0
+fi
+EOF
+  chmod +x "$STUB_DIR/realm"
+
+  cat > "$STUB_DIR/fb-realm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--help" ]]; then
+  echo "A high efficiency relay tool"
+else
+  exit 0
+fi
+EOF
+  chmod +x "$STUB_DIR/fb-realm"
+}
+
+stage_script() {
+  cp "$SCRIPT_PATH" "$RUNTIME_SCRIPT"
+  chmod +x "$RUNTIME_SCRIPT"
 }
 
 run_fb() {
-  FB_TEST_MODE=1 \
-  FB_CONF_DIR="$CONF_DIR" \
-  FB_BACKUP_DIR="$BACKUP_DIR" \
-  FB_LOG_DIR="$LOG_DIR" \
-  FB_STATE_DIR="$STATE_DIR" \
-  FB_TMP_DIR="$TMP_DIR" \
-  FB_SELF_TARGET="$SELF_TARGET" \
-  FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
-  FB_SYSCTL_FILE="$SYSCTL_FILE" \
-  PATH="$STUB_DIR:$PATH" \
-  bash "$SCRIPT_PATH" "$@"
+  local realm_env=() gost_env=()
+  [[ -n "${FB_REALM_TARGET_BIN:-}" ]] && realm_env=(FB_REALM_TARGET_BIN="$FB_REALM_TARGET_BIN")
+  [[ -n "${FB_GOST_TARGET_BIN:-}" ]] && gost_env=(FB_GOST_TARGET_BIN="$FB_GOST_TARGET_BIN")
+  stage_script
+  env \
+    FB_TEST_MODE=1 \
+    FB_CONF_DIR="$CONF_DIR" \
+    FB_BACKUP_DIR="$BACKUP_DIR" \
+    FB_LOG_DIR="$LOG_DIR" \
+    FB_STATE_DIR="$STATE_DIR" \
+    FB_TMP_DIR="$TMP_DIR" \
+    FB_SELF_TARGET="$SELF_TARGET" \
+    FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
+    FB_SYSCTL_FILE="$SYSCTL_FILE" \
+    "${realm_env[@]}" \
+    "${gost_env[@]}" \
+    PATH="$STUB_DIR:$PATH" \
+    bash "$RUNTIME_SCRIPT" "$@"
 }
 
 run_fb_with_input() {
   local input="$1"
   shift
+  local realm_env=() gost_env=()
+  [[ -n "${FB_REALM_TARGET_BIN:-}" ]] && realm_env=(FB_REALM_TARGET_BIN="$FB_REALM_TARGET_BIN")
+  [[ -n "${FB_GOST_TARGET_BIN:-}" ]] && gost_env=(FB_GOST_TARGET_BIN="$FB_GOST_TARGET_BIN")
+  stage_script
   printf '%s' "$input" | \
-  FB_TEST_MODE=1 \
-  FB_CONF_DIR="$CONF_DIR" \
-  FB_BACKUP_DIR="$BACKUP_DIR" \
-  FB_LOG_DIR="$LOG_DIR" \
-  FB_STATE_DIR="$STATE_DIR" \
-  FB_TMP_DIR="$TMP_DIR" \
-  FB_SELF_TARGET="$SELF_TARGET" \
-  FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
-  FB_SYSCTL_FILE="$SYSCTL_FILE" \
-  PATH="$STUB_DIR:$PATH" \
-  bash "$SCRIPT_PATH" "$@"
+  env \
+    FB_TEST_MODE=1 \
+    FB_CONF_DIR="$CONF_DIR" \
+    FB_BACKUP_DIR="$BACKUP_DIR" \
+    FB_LOG_DIR="$LOG_DIR" \
+    FB_STATE_DIR="$STATE_DIR" \
+    FB_TMP_DIR="$TMP_DIR" \
+    FB_SELF_TARGET="$SELF_TARGET" \
+    FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
+    FB_SYSCTL_FILE="$SYSCTL_FILE" \
+    "${realm_env[@]}" \
+    "${gost_env[@]}" \
+    PATH="$STUB_DIR:$PATH" \
+    bash "$RUNTIME_SCRIPT" "$@"
 }
 
 run_fb_stdin() {
-  FB_TEST_MODE=1 \
-  FB_CONF_DIR="$CONF_DIR" \
-  FB_BACKUP_DIR="$BACKUP_DIR" \
-  FB_LOG_DIR="$LOG_DIR" \
-  FB_STATE_DIR="$STATE_DIR" \
-  FB_TMP_DIR="$TMP_DIR" \
-  FB_SELF_TARGET="$SELF_TARGET" \
-  FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
-  FB_SYSCTL_FILE="$SYSCTL_FILE" \
-  FB_SELF_SOURCE_URL="https://example.invalid/fb.sh" \
-  FB_TEST_DOWNLOAD_SOURCE="$SCRIPT_PATH" \
-  PATH="$STUB_DIR:$PATH" \
-  bash -s -- "$@" < "$SCRIPT_PATH"
+  local realm_env=() gost_env=()
+  [[ -n "${FB_REALM_TARGET_BIN:-}" ]] && realm_env=(FB_REALM_TARGET_BIN="$FB_REALM_TARGET_BIN")
+  [[ -n "${FB_GOST_TARGET_BIN:-}" ]] && gost_env=(FB_GOST_TARGET_BIN="$FB_GOST_TARGET_BIN")
+  stage_script
+  env \
+    FB_TEST_MODE=1 \
+    FB_CONF_DIR="$CONF_DIR" \
+    FB_BACKUP_DIR="$BACKUP_DIR" \
+    FB_LOG_DIR="$LOG_DIR" \
+    FB_STATE_DIR="$STATE_DIR" \
+    FB_TMP_DIR="$TMP_DIR" \
+    FB_SELF_TARGET="$SELF_TARGET" \
+    FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
+    FB_SYSCTL_FILE="$SYSCTL_FILE" \
+    FB_SELF_SOURCE_URL="https://example.invalid/fb.sh" \
+    FB_TEST_DOWNLOAD_SOURCE="$SCRIPT_PATH" \
+    "${realm_env[@]}" \
+    "${gost_env[@]}" \
+    PATH="$STUB_DIR:$PATH" \
+    bash -s -- "$@" < "$RUNTIME_SCRIPT"
 }
 
 main() {
   reset_env
+  FB_REALM_TARGET_BIN="$STUB_DIR/fb-realm"
 
   bash -n "$SCRIPT_PATH"
   pass "bash -n syntax check"
@@ -211,7 +262,7 @@ main() {
   local realm_service
   realm_service="$(find "$SYSTEMD_DIR" -maxdepth 1 -name 'fb-realm-*.service' | head -n1)"
   assert_file_exists "$realm_service" "realm service generated"
-  assert_file_contains "$realm_service" "$STUB_DIR/realm -c" "realm service uses detected binary path"
+  assert_file_contains "$realm_service" "$STUB_DIR/fb-realm -c" "realm service avoids conflicting system realm binary"
 
   if run_fb add haproxy tcp 0.0.0.0 30002 3.3.3.3 80 >/dev/null 2>&1; then
     fail "haproxy add should fail when binary is absent"
@@ -252,6 +303,11 @@ main() {
   assert_file_missing "$SYSTEMD_DIR/fb-rebuild.service" "uninstall removed rebuild service"
   gost_service="$(find "$SYSTEMD_DIR" -maxdepth 1 -name 'fb-gost-*.service' | head -n1)"
   assert_file_exists "$gost_service" "uninstall keep mode preserved existing forwarding services"
+
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_ROOT/bin/fb-realm"
+  chmod +x "$TEST_ROOT/bin/fb-realm"
+  FB_REALM_TARGET_BIN="$TEST_ROOT/bin/fb-realm" run_fb purge >/dev/null
+  assert_file_missing "$TEST_ROOT/bin/fb-realm" "purge removed dedicated realm binary"
 
   pass "all mock integration checks passed"
 }

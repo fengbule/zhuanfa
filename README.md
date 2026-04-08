@@ -99,7 +99,7 @@ fb batch-add realm tcp 0.0.0.0 33001 22 1.1.1.1,2.2.2.2,3.3.3.3:2222
 - `fb uninstall`
   仅卸载 `fb` 命令与开机重建入口，保留现有转发服务和配置
 - `fb uninstall purge`
-  彻底卸载服务、规则、配置、备份
+  彻底卸载服务、规则、配置、备份，以及脚本安装的专用 `fb-gost` / `fb-realm` 二进制
 - `fb purge`
   彻底卸载，并尽量删除当前这个脚本文件
 
@@ -123,8 +123,9 @@ fb batch-add realm tcp 0.0.0.0 33001 22 1.1.1.1,2.2.2.2,3.3.3.3:2222
 
 1. 默认基于 `systemd`。
 2. `gost` / `realm` 会按当前 CPU 架构自动匹配 GitHub Release 资源。
-3. `batch-add` 是批量生成多条规则，不是单监听口负载均衡。
-4. `fb uninstall` 不会主动停掉现有非 `fb-rebuild` 转发实例，但系统重启后若是 `iptables` 规则不会自动重建。
+3. `realm` 会优先使用专用的 `fb-realm` 二进制，避免和系统里可能存在的 `realmd realm` 命令冲突。
+4. `batch-add` 是批量生成多条规则，不是单监听口负载均衡。
+5. `fb uninstall` 不会主动停掉现有非 `fb-rebuild` 转发实例，但系统重启后若是 `iptables` 规则不会自动重建。
 
 ## 测试
 

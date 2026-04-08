@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.5}"
+APP_VERSION="${APP_VERSION:-v1.2.6}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -16,6 +16,8 @@ SELF_TARGET="${FB_SELF_TARGET:-/usr/local/bin/fb}"
 SYSTEMD_DIR="${FB_SYSTEMD_DIR:-/etc/systemd/system}"
 SYSCTL_FILE="${FB_SYSCTL_FILE:-/etc/sysctl.d/99-fb.conf}"
 DEFAULT_LISTEN_ADDR="${FB_DEFAULT_LISTEN_ADDR:-0.0.0.0}"
+GOST_TARGET_BIN="${FB_GOST_TARGET_BIN:-/usr/local/bin/fb-gost}"
+REALM_TARGET_BIN="${FB_REALM_TARGET_BIN:-/usr/local/bin/fb-realm}"
 
 C0='\033[0m'
 C1='\033[0;32m'
@@ -294,10 +296,39 @@ latest_asset_url() {
     | head -n1
 }
 
+is_realm_relay_binary() {
+  local bin="${1:-}"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  "$bin" --help 2>&1 | grep -qiE 'relay tool|static tcp relay'
+}
+
+find_gost_binary() {
+  if [[ -x "$GOST_TARGET_BIN" ]]; then
+    printf '%s\n' "$GOST_TARGET_BIN"
+    return 0
+  fi
+  command -v gost 2>/dev/null || true
+}
+
+find_realm_binary() {
+  if is_realm_relay_binary "$REALM_TARGET_BIN"; then
+    printf '%s\n' "$REALM_TARGET_BIN"
+    return 0
+  fi
+  local existing
+  existing="$(command -v realm 2>/dev/null || true)"
+  if is_realm_relay_binary "$existing"; then
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  return 1
+}
+
 install_gost_binary() {
-  local url tmpd bin arch_pat
-  if cmd_exists gost; then
-    log "gost 已存在：$(command -v gost)"
+  local url tmpd bin arch_pat existing
+  existing="$(find_gost_binary)"
+  if [[ -n "$existing" ]]; then
+    log "gost 已存在：$existing"
     return 0
   fi
   tmpd="$(mktemp -d)"
@@ -311,14 +342,15 @@ install_gost_binary() {
   esac
   bin="$(find "$tmpd" -type f -name gost | head -n1)"
   [[ -n "$bin" ]] || die "gost 安装失败：未找到二进制文件。"
-  install -m 0755 "$bin" /usr/local/bin/gost
+  install -m 0755 "$bin" "$GOST_TARGET_BIN"
   rm -rf "$tmpd"
 }
 
 install_realm_binary() {
-  local url tmpd bin arch_pat
-  if cmd_exists realm; then
-    log "realm 已存在：$(command -v realm)"
+  local url tmpd bin arch_pat existing
+  existing="$(find_realm_binary || true)"
+  if [[ -n "$existing" ]]; then
+    log "realm 已存在：$existing"
     return 0
   fi
   tmpd="$(mktemp -d)"
@@ -332,7 +364,7 @@ install_realm_binary() {
   esac
   bin="$(find "$tmpd" -type f -name realm | head -n1)"
   [[ -n "$bin" ]] || die "realm 安装失败：未找到二进制文件。"
-  install -m 0755 "$bin" /usr/local/bin/realm
+  install -m 0755 "$bin" "$REALM_TARGET_BIN"
   rm -rf "$tmpd"
 }
 
@@ -439,6 +471,13 @@ delete_invocation_source_if_needed() {
   [[ -n "$src" && -f "$src" ]] || return 0
   [[ "$src" == "$SELF_TARGET" ]] && return 0
   rm -f "$src" 2>/dev/null || true
+}
+
+cleanup_method_binaries() {
+  rm -f "$GOST_TARGET_BIN" "$REALM_TARGET_BIN"
+  if is_realm_relay_binary "/usr/local/bin/realm"; then
+    rm -f /usr/local/bin/realm
+  fi
 }
 
 ensure_iptables_base() {
@@ -661,7 +700,7 @@ WantedBy=multi-user.target"
 make_gost_service() {
   local id="$1" listen_addr="$2" listen_port="$3" target_host="$4" target_port="$5"
   local gost_bin
-  gost_bin="$(bin_path gost)"
+  gost_bin="$(find_gost_binary)"
   [[ -n "$gost_bin" ]] || { err "未找到 gost 可执行文件。"; return 1; }
   create_or_update_service "fb-gost-${id}.service" "[Unit]
 Description=FB gost ${id}
@@ -681,7 +720,7 @@ WantedBy=multi-user.target"
 make_realm_config_and_service() {
   local id="$1" listen_addr="$2" listen_port="$3" target_host="$4" target_port="$5"
   local realm_bin
-  realm_bin="$(bin_path realm)"
+  realm_bin="$(find_realm_binary || true)"
   [[ -n "$realm_bin" ]] || { err "未找到 realm 可执行文件。"; return 1; }
   mkdir -p "$CONF_DIR/realm"
   cat > "$CONF_DIR/realm/${id}.toml" <<EOCFG
@@ -1011,6 +1050,7 @@ uninstall_self() {
     done <<< "$units"
   fi
   cleanup_iptables_all || true
+  cleanup_method_binaries || true
   systemctl daemon-reload || true
   rm -f "$SELF_TARGET"
   remove_network_optimization || true
@@ -1269,7 +1309,7 @@ help_msg() {
   1. 默认基于 systemd。
   2. iptables 使用独立 FB_* 链，不会直接清空你现有的其他规则。
   3. haproxy / rinetd / nginx 使用“专用实例”配置，不覆盖你已有主服务配置。
-  4. gost / realm 若自动安装失败，请手动将二进制放入 PATH 后重试。
+  4. gost / realm 若自动安装失败，请手动将二进制放入 PATH；realm 会优先使用专用的 fb-realm，避免与系统 realmd 的 realm 冲突。
   5. batch-add 为“同一方案批量添加多 IP”模式，会按起始监听端口依次递增。
   6. 规则变更采用临时库 + 自动备份，重建失败会自动回滚。
   7. fb uninstall 仅卸载命令与开机重建入口，现有转发服务和配置会保留。
