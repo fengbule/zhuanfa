@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.4}"
+APP_VERSION="${APP_VERSION:-v1.2.5}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -41,6 +41,16 @@ trim() {
 
 is_test_mode() {
   [[ "${FB_TEST_MODE:-0}" == "1" ]]
+}
+
+read_prompt() {
+  local __result_var="$1" prompt="$2" input=""
+  if [[ -t 0 && -r /dev/tty ]]; then
+    IFS= read -r -p "$prompt" input < /dev/tty || input=""
+  else
+    IFS= read -r -p "$prompt" input || input=""
+  fi
+  printf -v "$__result_var" '%s' "$input"
 }
 
 
@@ -92,18 +102,18 @@ pkg_install() {
   case "$pkg_mgr" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y "${pkgs[@]}"
+      apt-get update -y </dev/null
+      apt-get install -y "${pkgs[@]}" </dev/null
       ;;
     dnf)
-      dnf install -y "${pkgs[@]}"
+      dnf install -y "${pkgs[@]}" </dev/null
       ;;
     yum)
-      yum install -y epel-release || true
-      yum install -y "${pkgs[@]}"
+      yum install -y epel-release </dev/null || true
+      yum install -y "${pkgs[@]}" </dev/null
       ;;
     apk)
-      apk add --no-cache "${pkgs[@]}"
+      apk add --no-cache "${pkgs[@]}" </dev/null
       ;;
     *)
       die "未知包管理器：$pkg_mgr"
@@ -376,6 +386,10 @@ rule_count() {
 
 resolve_host_status() {
   local host="$1"
+  [[ -n "$host" ]] || {
+    echo "fail"
+    return 0
+  }
   if getent ahosts "$host" >/dev/null 2>&1; then
     echo "ok"
   else
@@ -708,10 +722,14 @@ stop_if_no_rules() {
 backup_configs() {
   need_root
   init_dirs
-  local ts file
+  local ts file tmp_file
   ts="$(date +%Y%m%d-%H%M%S)"
   file="$BACKUP_DIR/fb-backup-${ts}.tar.gz"
-  tar -czf "$file" "$CONF_DIR" "$SYSTEMD_DIR"/fb-*.service 2>/dev/null || tar -czf "$file" "$CONF_DIR"
+  tmp_file="$TMP_DIR/fb-backup-${ts}.tar.gz"
+  rm -f "$tmp_file"
+  tar --exclude="$BACKUP_DIR" --exclude="$BACKUP_DIR/*" -czf "$tmp_file" "$CONF_DIR" "$SYSTEMD_DIR"/fb-*.service 2>/dev/null \
+    || tar --exclude="$BACKUP_DIR" --exclude="$BACKUP_DIR/*" -czf "$tmp_file" "$CONF_DIR"
+  mv -f "$tmp_file" "$file"
   echo "$file"
 }
 
@@ -1259,7 +1277,7 @@ EOH
 }
 
 pause_enter() {
-  read -rp "按回车继续..." _
+  read_prompt _ "按回车继续..."
 }
 
 show_banner() {
@@ -1289,7 +1307,7 @@ interactive_pick_method() {
   echo
   echo "性能排序：iptables > realm > HAProxy/nginx > socat/rinetd > gost"
   echo "功能排序：gost > nginx/HAProxy > realm > socat/rinetd > iptables"
-  read -rp "请选择方案 [1]: " n
+  read_prompt n "请选择方案 [1]: "
   n="${n:-1}"
   case "$n" in
     1) picked="iptables" ;;
@@ -1333,7 +1351,7 @@ ensure_self_installed_for_menu() {
 prompt_proto_for_method() {
   local method="$1" __result_var="${2:-}" proto_value="tcp"
   if [[ "$method" == "iptables" || "$method" == "socat" ]]; then
-    read -rp "协议类型 [tcp]: " proto_value
+    read_prompt proto_value "协议类型 [tcp]: "
     proto_value="${proto_value:-tcp}"
   fi
   if [[ -n "$__result_var" ]]; then
@@ -1347,7 +1365,7 @@ menu_add_rule() {
   local method proto listen_addr listen_port target_host target_port status
   show_banner
   echo -e "${C4}请输入转发配置信息：${C0}"
-  read -rp "目标服务器 IP/域名: " target_host
+  read_prompt target_host "目标服务器 IP/域名: "
   [[ -n "$target_host" ]] || die "目标地址不能为空。"
   status="$(resolve_host_status "$target_host")"
   if [[ "$status" == "ok" ]]; then
@@ -1355,10 +1373,10 @@ menu_add_rule() {
   else
     echo -e "解析检测：${C2}未解析成功${C0}（若是内网目标或稍后可达，可继续）"
   fi
-  read -rp "目标端口: " target_port
-  read -rp "本地监听地址 [0.0.0.0]: " listen_addr
+  read_prompt target_port "目标端口: "
+  read_prompt listen_addr "本地监听地址 [0.0.0.0]: "
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
-  read -rp "本地监听端口: " listen_port
+  read_prompt listen_port "本地监听端口: "
   echo
   interactive_pick_method method
   prompt_proto_for_method "$method" proto
@@ -1368,7 +1386,7 @@ menu_add_rule() {
   echo "本地监听：${listen_addr}:${listen_port}"
   echo "协议类型：${proto}"
   echo "转发方式：${method}"
-  read -rp "确认添加？[Y/n]: " yn
+  read_prompt yn "确认添加？[Y/n]: "
   yn="${yn:-Y}"
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   add_rule "$method" "$proto" "$listen_addr" "$listen_port" "$target_host" "$target_port"
@@ -1381,12 +1399,12 @@ menu_batch_add_rules() {
   echo "说明：会按起始监听端口自动递增，例如 33001,33002,33003 ..."
   echo "目标格式支持：1.1.1.1,2.2.2.2,example.com:2222"
   echo
-  read -rp "多个目标 IP/域名（逗号分隔）: " targets_csv
+  read_prompt targets_csv "多个目标 IP/域名（逗号分隔）: "
   [[ -n "$targets_csv" ]] || die "目标列表不能为空。"
-  read -rp "默认目标端口: " target_port
-  read -rp "本地监听地址 [0.0.0.0]: " listen_addr
+  read_prompt target_port "默认目标端口: "
+  read_prompt listen_addr "本地监听地址 [0.0.0.0]: "
   listen_addr="${listen_addr:-$DEFAULT_LISTEN_ADDR}"
-  read -rp "起始本地监听端口: " start_port
+  read_prompt start_port "起始本地监听端口: "
   echo
   interactive_pick_method method
   prompt_proto_for_method "$method" proto
@@ -1398,7 +1416,7 @@ menu_batch_add_rules() {
   echo "起始监听端口：$start_port"
   echo "协议类型：$proto"
   echo "转发方式：$method"
-  read -rp "确认批量添加？[Y/n]: " yn
+  read_prompt yn "确认批量添加？[Y/n]: "
   yn="${yn:-Y}"
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   batch_add_rules "$method" "$proto" "$listen_addr" "$start_port" "$target_port" "$targets_csv"
@@ -1408,9 +1426,9 @@ menu_delete_rule() {
   show_banner
   list_rules
   echo
-  read -rp "输入要删除的规则 ID: " id
+  read_prompt id "输入要删除的规则 ID: "
   [[ -n "${id:-}" ]] || return 0
-  read -rp "确认删除？[y/N]: " yn
+  read_prompt yn "确认删除？[y/N]: "
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   delete_rule "$id"
 }
@@ -1431,14 +1449,14 @@ menu_restore_backup() {
   echo "可用备份："
   list_backups || true
   echo
-  read -rp "输入备份文件完整路径: " f
+  read_prompt f "输入备份文件完整路径: "
   [[ -n "${f:-}" ]] || return 0
   restore_configs "$f"
 }
 
 menu_stop_services() {
   show_banner
-  read -rp "确认停止所有 fb 相关服务？[y/N]: " yn
+  read_prompt yn "确认停止所有 fb 相关服务？[y/N]: "
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   stop_all_services
 }
@@ -1448,7 +1466,7 @@ menu_uninstall() {
   echo "1) 仅卸载 fb 命令，保留现有转发服务和配置"
   echo "2) 彻底卸载（删除脚本 / 服务 / 配置 / 备份 / 网络优化）"
   echo "3) 彻底卸载，并删除当前这个脚本文件"
-  read -rp "请选择 [1]: " n
+  read_prompt n "请选择 [1]: "
   n="${n:-1}"
   case "$n" in
     1) uninstall_self yes ;;
@@ -1476,7 +1494,7 @@ menu_loop() {
     echo "13) 查看方案推荐"
     echo "0) 退出"
     echo
-    read -rp "请选择操作 [1]: " choice
+    read_prompt choice "请选择操作 [1]: "
     choice="${choice:-1}"
     case "$choice" in
       1) menu_add_rule; pause_enter ;;
