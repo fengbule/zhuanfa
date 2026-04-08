@@ -68,6 +68,16 @@ EOF
   chmod +x "$STUB_DIR/$name"
 }
 
+make_noisy_iptables_stub() {
+  cat > "$STUB_DIR/iptables" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "FB_PREROUTING noisy stdout"
+exit 0
+EOF
+  chmod +x "$STUB_DIR/iptables"
+}
+
 reset_env() {
   rm -rf "$TEST_ROOT"
   mkdir -p "$STUB_DIR" "$BACKUP_DIR" "$SYSTEMD_DIR" "$(dirname "$SELF_TARGET")" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR" "$(dirname "$SYSCTL_FILE")" "$(dirname "$RUNTIME_SCRIPT")"
@@ -281,12 +291,50 @@ main() {
   fi
   pass "rollback removed failed haproxy rule"
 
+  make_stub haproxy
+  make_stub rinetd
+  make_stub nginx
+
+  run_fb add haproxy tcp 0.0.0.0 30002 3.3.3.3 80 >/dev/null
+  assert_rule_count 3 "haproxy rule added"
+  local haproxy_service
+  haproxy_service="$SYSTEMD_DIR/fb-haproxy.service"
+  assert_file_exists "$haproxy_service" "haproxy service generated"
+  assert_file_contains "$haproxy_service" "$STUB_DIR/haproxy -W -db -f $CONF_DIR/haproxy/haproxy.cfg" "haproxy service uses dedicated config"
+  assert_file_contains "$CONF_DIR/haproxy/haproxy.cfg" "frontend fe_" "haproxy config rendered frontend"
+
+  run_fb add rinetd tcp 0.0.0.0 30003 6.6.6.6 443 >/dev/null
+  assert_rule_count 4 "rinetd rule added"
+  local rinetd_service
+  rinetd_service="$SYSTEMD_DIR/fb-rinetd.service"
+  assert_file_exists "$rinetd_service" "rinetd service generated"
+  assert_file_contains "$rinetd_service" "$STUB_DIR/rinetd -f -c $CONF_DIR/rinetd/rinetd.conf" "rinetd service uses dedicated config"
+  assert_file_contains "$CONF_DIR/rinetd/rinetd.conf" "0.0.0.0 30003 6.6.6.6 443" "rinetd config rendered target rule"
+
+  run_fb add nginx tcp 0.0.0.0 30004 7.7.7.7 80 >/dev/null
+  assert_rule_count 5 "nginx rule added"
+  local nginx_service nginx_rule
+  nginx_service="$SYSTEMD_DIR/fb-nginx.service"
+  assert_file_exists "$nginx_service" "nginx service generated"
+  assert_file_contains "$nginx_service" "$STUB_DIR/nginx -g 'daemon off;' -c $CONF_DIR/nginx/nginx.conf" "nginx service uses dedicated config"
+  nginx_rule="$(find "$CONF_DIR/nginx/streams" -maxdepth 1 -name '*.conf' | head -n1)"
+  assert_file_exists "$nginx_rule" "nginx stream rule generated"
+  assert_file_contains "$nginx_rule" "proxy_pass 7.7.7.7:80;" "nginx stream config rendered target"
+
   run_fb batch-add gost tcp 0.0.0.0 31000 22 4.4.4.4,5.5.5.5:2222 >/dev/null
-  assert_rule_count 4 "batch add committed two gost rules"
+  assert_rule_count 7 "batch add committed two gost rules"
   local gost_service
   gost_service="$(find "$SYSTEMD_DIR" -maxdepth 1 -name 'fb-gost-*.service' | head -n1)"
   assert_file_exists "$gost_service" "gost service generated"
   assert_file_contains "$gost_service" "$STUB_DIR/gost -L=tcp://" "gost service uses detected binary path"
+
+  make_noisy_iptables_stub
+  local add_output
+  add_output="$(run_fb add realm tcp 0.0.0.0 30005 8.8.8.8 22 2>&1)"
+  [[ "$add_output" == *"$BACKUP_DIR/fb-backup-"* ]] || fail "add output should still report backup path"
+  [[ "$add_output" != *"FB_PREROUTING noisy stdout"* ]] || fail "backup path logging should not be polluted by rebuild stdout"
+  pass "backup path logging stayed clean when rebuild emitted stdout"
+  assert_rule_count 8 "extra realm rule added after noisy rebuild test"
 
   local backup_file
   backup_file="$(run_fb backup | tail -n1)"
@@ -300,10 +348,10 @@ main() {
   realm_id="$(awk -F'|' '$2=="realm"{print $1; exit}' "$CONF_DIR/rules.db")"
   [[ -n "$realm_id" ]] || fail "missing realm rule id"
   run_fb del "$realm_id" >/dev/null
-  assert_rule_count 3 "delete rule committed"
+  assert_rule_count 7 "delete rule committed"
 
   run_fb restore "$backup_file" >/dev/null
-  assert_rule_count 4 "restore recovered deleted rule"
+  assert_rule_count 8 "restore recovered deleted rule"
 
   touch "$SELF_TARGET"
   run_fb uninstall >/dev/null

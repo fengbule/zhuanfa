@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-fb}"
 APP_DESC="${APP_DESC:-端口转发管理工具}"
-APP_VERSION="${APP_VERSION:-v1.2.8}"
+APP_VERSION="${APP_VERSION:-v1.2.9}"
 APP_REPO="${APP_REPO:-https://github.com/fengbule/zhuanfa}"
 SELF_SOURCE_URL="${FB_SELF_SOURCE_URL:-https://raw.githubusercontent.com/fengbule/zhuanfa/main/fb.sh}"
 CONF_DIR="${FB_CONF_DIR:-/etc/fb}"
@@ -184,28 +184,60 @@ ensure_sysctl_line() {
   fi
 }
 
+sysctl_key_path() {
+  local key="$1"
+  printf '/proc/sys/%s\n' "${key//./\/}"
+}
+
+apply_sysctl_setting() {
+  local key="$1" value="$2"
+  local key_path
+  key_path="$(sysctl_key_path "$key")"
+  if [[ ! -e "$key_path" ]]; then
+    warn "内核未提供参数 $key，已跳过。"
+    return 1
+  fi
+  if sysctl -q -w "$key=$value" >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "参数 $key=$value 当前环境不支持，已跳过。"
+  return 1
+}
+
 optimize_network() {
   need_root
   is_test_mode && return 0
-  local file="$SYSCTL_FILE"
+  local file="$SYSCTL_FILE" skipped=0 key value
   touch "$file"
+  : > "$file"
   modprobe tcp_bbr 2>/dev/null || true
-  ensure_sysctl_line "$file" "net.ipv4.ip_forward" "1"
-  ensure_sysctl_line "$file" "net.core.default_qdisc" "fq"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_congestion_control" "bbr"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_fastopen" "3"
-  ensure_sysctl_line "$file" "net.core.rmem_max" "67108864"
-  ensure_sysctl_line "$file" "net.core.wmem_max" "67108864"
-  ensure_sysctl_line "$file" "net.core.rmem_default" "262144"
-  ensure_sysctl_line "$file" "net.core.wmem_default" "262144"
-  ensure_sysctl_line "$file" "net.core.netdev_max_backlog" "16384"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_rmem" "4096 87380 67108864"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_wmem" "4096 65536 67108864"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_mtu_probing" "1"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_slow_start_after_idle" "0"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_fin_timeout" "15"
-  ensure_sysctl_line "$file" "net.ipv4.tcp_keepalive_time" "600"
-  sysctl --system >/dev/null || warn "sysctl 应用时有个别项未生效，请手动检查内核支持情况。"
+  while IFS='=' read -r key value; do
+    [[ -n "${key:-}" ]] || continue
+    if apply_sysctl_setting "$key" "$value"; then
+      printf '%s = %s\n' "$key" "$value" >> "$file"
+    else
+      skipped=$((skipped + 1))
+    fi
+  done <<'EOF'
+net.ipv4.ip_forward=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.core.netdev_max_backlog=16384
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=600
+EOF
+  if (( skipped > 0 )); then
+    warn "网络优化中有 ${skipped} 项因当前内核/容器环境限制被跳过。"
+  fi
   log "网络优化已应用：BBR / TFO / 缓冲区 / IP Forward。"
 }
 
@@ -918,9 +950,9 @@ commit_rules_db_transaction() {
   local rollback_db backup_file
   rollback_db="$(mktemp "$TMP_DIR/rules.rollback.XXXXXX")"
   cp "$RULES_DB" "$rollback_db"
-  backup_file="$(backup_configs)"
+  backup_file="$(backup_configs | tail -n1)"
   cp "$staged_db" "$RULES_DB"
-  if rebuild_services_from_db "$RULES_DB"; then
+  if rebuild_services_from_db "$RULES_DB" >/dev/null; then
     rm -f "$staged_db" "$rollback_db"
     printf '%s' "$backup_file"
     return 0
@@ -928,7 +960,7 @@ commit_rules_db_transaction() {
 
   err "${action}失败，正在回滚到变更前状态..."
   cp "$rollback_db" "$RULES_DB"
-  if ! rebuild_services_from_db "$RULES_DB"; then
+  if ! rebuild_services_from_db "$RULES_DB" >/dev/null; then
     err "自动回滚后的服务重建也失败，请优先执行：fb restore $backup_file"
   fi
   rm -f "$staged_db" "$rollback_db"
@@ -1231,14 +1263,14 @@ restore_configs() {
   need_root
   local file="$1" current_backup
   [[ -f "$file" ]] || die "备份文件不存在：$file"
-  current_backup="$(backup_configs)"
+  current_backup="$(backup_configs | tail -n1)"
   tar -xzf "$file" -C /
   systemctl daemon-reload
-  if ! rebuild_services_from_db; then
+  if ! rebuild_services_from_db >/dev/null; then
     err "备份恢复失败，正在尝试回滚到恢复前状态..."
     tar -xzf "$current_backup" -C /
     systemctl daemon-reload || true
-    rebuild_services_from_db || true
+    rebuild_services_from_db >/dev/null || true
     die "备份恢复失败，已尝试回滚。恢复前备份：$current_backup"
   fi
   log "备份已恢复：$file"
