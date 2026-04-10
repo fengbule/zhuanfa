@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fb.sh"
 TEST_ROOT="$(pwd)/.mock-fb"
 STUB_DIR="$TEST_ROOT/stubs"
+TEST_PATH="$STUB_DIR:/usr/bin:/bin"
 RUNTIME_SCRIPT="$TEST_ROOT/runtime/fb.sh"
 CONF_DIR="$TEST_ROOT/etc/fb"
 BACKUP_DIR="$CONF_DIR/backups"
@@ -199,7 +200,7 @@ run_fb() {
     FB_SYSCTL_FILE="$SYSCTL_FILE" \
     "${realm_env[@]}" \
     "${gost_env[@]}" \
-    PATH="$STUB_DIR:$PATH" \
+    PATH="$TEST_PATH" \
     bash "$RUNTIME_SCRIPT" "$@"
 }
 
@@ -223,7 +224,7 @@ run_fb_with_input() {
     FB_SYSCTL_FILE="$SYSCTL_FILE" \
     "${realm_env[@]}" \
     "${gost_env[@]}" \
-    PATH="$STUB_DIR:$PATH" \
+    PATH="$TEST_PATH" \
     bash "$RUNTIME_SCRIPT" "$@"
 }
 
@@ -246,7 +247,7 @@ run_fb_stdin() {
     FB_TEST_DOWNLOAD_SOURCE="$SCRIPT_PATH" \
     "${realm_env[@]}" \
     "${gost_env[@]}" \
-    PATH="$STUB_DIR:$PATH" \
+    PATH="$TEST_PATH" \
     bash -s -- "$@" < "$RUNTIME_SCRIPT"
 }
 

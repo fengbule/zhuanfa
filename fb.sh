@@ -538,8 +538,7 @@ remove_rule_line() {
 
 list_rules_raw() {
   local db_file="${1:-$RULES_DB}"
-  grep -vE '^\s*
-``` "$db_file" 2>/dev/null || true
+  grep -vE '^\s*$|^```' "$db_file" 2>/dev/null || true
 }
 
 rule_count() {
@@ -1295,6 +1294,27 @@ rule_service_name() {
   esac
 }
 
+iptables_rule_active() {
+  local id="$1"
+  cmd_exists iptables || return 1
+  iptables -t nat -S FB_PREROUTING 2>/dev/null | grep -Fq -- "fb:${id}" && return 0
+  iptables -t nat -S FB_OUTPUT 2>/dev/null | grep -Fq -- "fb:${id}" && return 0
+  return 1
+}
+
+rule_is_active() {
+  local id="$1" method="$2" svc
+  case "$method" in
+    iptables)
+      iptables_rule_active "$id"
+      ;;
+    *)
+      svc="$(rule_service_name "$id" "$method")"
+      systemctl is-active --quiet "$svc" 2>/dev/null
+      ;;
+  esac
+}
+
 probe_target_ms() {
   local host="$1" port="$2"
   local start end diff
@@ -1352,10 +1372,8 @@ show_status_pretty() {
   else
     while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
       [[ -n "${id:-}" ]] || continue
-      local svc mark listen_mark
-      svc="$(rule_service_name "$id" "$method")"
-
-      if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      local mark listen_mark
+      if rule_is_active "$id" "$method"; then
         mark="✅"
       else
         mark="⚠️"
@@ -1408,10 +1426,8 @@ status_rules() {
   echo "--------------------------------------------------------------------------------------------------------------------------------"
   while IFS='|' read -r id method proto listen_addr listen_port target_host target_port extra; do
     [[ -n "${id:-}" ]] || continue
-    local svc status rtt listen_state
-    svc="$(rule_service_name "$id" "$method")"
-
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    local status rtt listen_state
+    if rule_is_active "$id" "$method"; then
       status="active"
     else
       status="inactive"
