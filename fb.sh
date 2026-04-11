@@ -76,17 +76,28 @@ is_test_mode() {
   [[ "${FB_TEST_MODE:-0}" == "1" ]]
 }
 
+open_tty_fd() {
+  local __result_var="$1" tty_fd=""
+  [[ -c /dev/tty ]] || return 1
+  if { exec {tty_fd}<>/dev/tty; } 2>/dev/null; then
+    printf -v "$__result_var" '%s' "$tty_fd"
+    return 0
+  fi
+  return 1
+}
+
 read_prompt() {
-  local __result_var="$1" prompt="$2" input=""
+  local __result_var="$1" prompt="$2" input="" tty_fd=""
   if is_test_mode; then
     printf '%s' "$prompt"
     IFS= read -r input || input=""
   elif [[ -t 0 ]]; then
     printf '%s' "$prompt"
     IFS= read -r input || input=""
-  elif [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf '%s' "$prompt" > /dev/tty
-    IFS= read -r input < /dev/tty || input=""
+  elif open_tty_fd tty_fd; then
+    printf '%s' "$prompt" >&"$tty_fd"
+    IFS= read -r -u "$tty_fd" input || input=""
+    exec {tty_fd}>&-
   else
     printf '%s' "$prompt" >&2
     IFS= read -r input || input=""
