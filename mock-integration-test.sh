@@ -228,6 +228,32 @@ run_fb_with_input() {
     bash "$RUNTIME_SCRIPT" "$@"
 }
 
+run_fb_remote_with_input() {
+  local input="$1"
+  shift
+  local realm_env=() gost_env=()
+  [[ -n "${FB_REALM_TARGET_BIN:-}" ]] && realm_env=(FB_REALM_TARGET_BIN="$FB_REALM_TARGET_BIN")
+  [[ -n "${FB_GOST_TARGET_BIN:-}" ]] && gost_env=(FB_GOST_TARGET_BIN="$FB_GOST_TARGET_BIN")
+  stage_script
+  printf '%s' "$input" | \
+  env \
+    FB_TEST_MODE=1 \
+    FB_CONF_DIR="$CONF_DIR" \
+    FB_BACKUP_DIR="$BACKUP_DIR" \
+    FB_LOG_DIR="$LOG_DIR" \
+    FB_STATE_DIR="$STATE_DIR" \
+    FB_TMP_DIR="$TMP_DIR" \
+    FB_SELF_TARGET="$SELF_TARGET" \
+    FB_SYSTEMD_DIR="$SYSTEMD_DIR" \
+    FB_SYSCTL_FILE="$SYSCTL_FILE" \
+    FB_SELF_SOURCE_URL="https://example.invalid/fb.sh" \
+    FB_TEST_DOWNLOAD_SOURCE="$SCRIPT_PATH" \
+    "${realm_env[@]}" \
+    "${gost_env[@]}" \
+    PATH="$TEST_PATH" \
+    bash <(cat "$RUNTIME_SCRIPT") "$@"
+}
+
 run_fb_stdin() {
   local realm_env=() gost_env=()
   [[ -n "${FB_REALM_TARGET_BIN:-}" ]] && realm_env=(FB_REALM_TARGET_BIN="$FB_REALM_TARGET_BIN")
@@ -251,6 +277,17 @@ run_fb_stdin() {
     bash -s -- "$@" < "$RUNTIME_SCRIPT"
 }
 
+run_read_prompt_without_tty() {
+  local input="$1"
+  stage_script
+  if ! command -v setsid >/dev/null 2>&1; then
+    return 99
+  fi
+  printf '%s' "$input" | \
+  env PATH="$TEST_PATH" \
+    setsid bash -c '. <(head -n -1 "$1"); read_prompt value "prompt: "; printf "%s\n" "$value"' _ "$RUNTIME_SCRIPT"
+}
+
 main() {
   reset_env
   FB_REALM_TARGET_BIN="$STUB_DIR/fb-realm"
@@ -266,6 +303,29 @@ main() {
   bash -n "$SCRIPT_PATH"
   pass "bash -n syntax check"
 
+  local current_version_line
+  current_version_line="$(grep '^APP_VERSION=' "$SCRIPT_PATH")"
+
+  reset_env
+  sed 's/^APP_VERSION="${APP_VERSION:-v[^"]*}"/APP_VERSION="${APP_VERSION:-v0.0.1}"/' "$SCRIPT_PATH" > "$SELF_TARGET"
+  chmod +x "$SELF_TARGET"
+  run_fb_remote_with_input $'0\n' menu >/dev/null
+  assert_file_contains "$SELF_TARGET" "$current_version_line" "remote menu refreshed stale installed fb command"
+
+  local prompt_value
+  if prompt_value="$(run_read_prompt_without_tty $'stdin-fallback\n' 2>"$TEST_ROOT/read-prompt.err")"; then
+    assert_eq "stdin-fallback" "$prompt_value" "read_prompt fell back to stdin when /dev/tty is unavailable"
+    if grep -Fq "/dev/tty" "$TEST_ROOT/read-prompt.err"; then
+      fail "read_prompt should not emit /dev/tty errors when no controlling terminal is present"
+    fi
+    pass "read_prompt avoided /dev/tty errors without a controlling terminal"
+  elif [[ $? -eq 99 ]]; then
+    pass "skipped no-tty read_prompt check because setsid is unavailable"
+  else
+    fail "read_prompt no-tty fallback test failed"
+  fi
+
+  reset_env
   run_fb_with_input $'1\n9.9.9.9\n443\n\n32000\n1\n\nY\n\n0\n' menu >/dev/null
   assert_file_exists "$SELF_TARGET" "menu mode auto-installed fb command"
   assert_rule_count 1 "interactive menu added one rule"
